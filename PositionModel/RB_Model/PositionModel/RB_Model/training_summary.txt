@@ -1,0 +1,10 @@
+RB Model Training Summary
+Generated: 2025-08-24 18:53:27
+
+Model Performance:
+  Test RMSE: 0.58
+  Test MAE: 0.22
+  Test R²: 0.9931
+
+Features: 30
+Training samples: 30

@@ -1,0 +1,66 @@
+# Model files (too large for Git)
+*.pkl
+*.h5
+*.joblib
+
+# Data files (can be regenerated)
+*.csv
+*.parquet
+*.json
+
+# CatBoost temporary files
+catboost_info/
+*.tsv
+*.tfevents
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Model output directories (can be regenerated)
+*Model_Advanced/
+*Model_Advanced_*/
+
+# Large data directories
+data/raw/
+data/processed/
+data/staging/
+
+# But keep important config and structure files
+!data/processed/crosswalk.csv
+!data/processed/crosswalk_2025.csv
+!data/processed/master_sheet.csv
+!data/processed/master_sheet_2025.csv

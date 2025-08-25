@@ -1,0 +1,29 @@
+Goal: Master Sheet to train Model
+
+n working with NFL DFS data, ALWAYS use the existing crosswalk/master sheet infrastructure instead of trying to match directly from DK slates to NFL API data. Here's the workflow:
+Load DK slate (contains current salaries, opponents, slate info)
+Load master sheet (contains player_id crosswalks, historical data, join keys)
+Create join keys using: clean_name|norm_team|norm_pos format
+Merge datasets using pd.merge() on the join_key column
+Use master sheet's player_id to get NFL API data (NOT DK slate IDs)
+Key Functions to Use:
+clean_name() - removes Jr./Sr./III, special chars, converts to lowercase
+norm_team() - standardizes team abbreviations
+norm_pos() - standardizes position codes
+join_key = clean_name + "|" + norm_team + "|" + norm_pos
+Why This Works:
+DK slate IDs (like 56789) ≠ NFL API player_ids (like 00-0033106)
+Master sheet already has the crosswalk between different ID systems
+Join keys handle name/team/position variations across datasets
+This is the established pattern in your codebase
+DO NOT:
+Try to match DK slate IDs directly to NFL API
+Skip the master sheet/crosswalk step
+Assume player names/teams are identical across sources
+DO:
+Always check what master sheets are available in data/processed/
+Use the master sheet's player_id field for NFL API lookups
+Create standardized join keys for reliable matching
+Leverage the existing data infrastructure
+Remember: The crosswalk approach is the foundation of your data pipeline. Use it every time!
+This prompt should ensure I remember to use the proper crosswalk/master sheet approach instead of trying to reinvent the wheel

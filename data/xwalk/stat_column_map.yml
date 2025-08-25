@@ -1,0 +1,42 @@
+# Column mapping for boxscore data to standardized labels format
+# Maps your provider's column names to the required internal names
+
+# Required columns for DK points calculation
+game_date: game_date
+player_id: player_id
+
+# Passing stats
+passing_yards: pass_yds
+pass_yards: pass_yds
+pass_yds: pass_yds
+passing_touchdowns: pass_td
+pass_touchdowns: pass_td
+pass_td: pass_td
+passing_interceptions: pass_int
+pass_interceptions: pass_int
+pass_int: pass_int
+
+# Rushing stats
+rushing_yards: rush_yds
+rush_yards: rush_yds
+rush_yds: rush_yds
+rushing_touchdowns: rush_td
+rush_touchdowns: rush_td
+rush_td: rush_td
+
+# Receiving stats
+receptions: rec_rec
+rec: rec_rec
+receiving_yards: rec_yds
+rec_yards: rec_yds
+rec_yds: rec_yds
+receiving_touchdowns: rec_td
+rec_touchdowns: rec_td
+rec_td: rec_td
+
+# Other stats
+two_point_conversions: two_pt
+two_pt: two_pt
+fumbles: fumbles_lost
+fumbles_lost: fumbles_lost
+

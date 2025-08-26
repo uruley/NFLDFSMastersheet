@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Advanced WR Model Inference Script (Aligned with TE Model)
+Advanced WR Model Inference Script (Updated for DK Salaries)
 Works with ensemble models (LightGBM, CatBoost, Random Forest, Gradient Boosting)
-Uses current-week features, proper scaling, and outputs 5+ past weeks plus upcoming week
+Uses current-week features, outputs 5+ past weeks, upcoming week with DK salaries
 """
 import pandas as pd
 import numpy as np
@@ -17,7 +17,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class WRInferenceEngine:
-    """Advanced WR inference engine with SHAP explanations and dynamic weighting."""
+    """Advanced WR inference engine with SHAP explanations, dynamic weighting, and DK salaries."""
 
     def __init__(self, model_dir: str):
         """Initialize the inference engine."""
@@ -131,6 +131,23 @@ class WRInferenceEngine:
         })
         print(f"Loaded {len(upcoming_data)} upcoming WR records (placeholder)")
         return upcoming_data
+
+    def load_dk_salaries(self, master_sheet_path, season, week):
+        """Load DraftKings salaries from master sheet for specific season and week."""
+        print(f"Loading DK salaries from {master_sheet_path} for season {season}, week {week}...")
+        try:
+            dk_data = pd.read_csv(master_sheet_path)
+            # Filter for WRs only (master sheet is already for 2025 Week 1)
+            dk_data = dk_data[dk_data['Position'] == 'WR'].copy()
+            dk_data = dk_data.rename(columns={'Name': 'player_name', 'Salary': 'dk_salary', 'TeamAbbrev': 'recent_team'})
+            # Add season and week columns since master sheet doesn't have them
+            dk_data['season'] = season
+            dk_data['week'] = week
+            print(f"Loaded {len(dk_data)} DK salary records for WRs")
+            return dk_data[['player_id', 'player_name', 'recent_team', 'season', 'week', 'dk_salary', 'join_key']]
+        except Exception as e:
+            print(f"❌ Error loading DK salaries: {e}")
+            return pd.DataFrame(columns=['player_id', 'player_name', 'recent_team', 'season', 'week', 'dk_salary', 'join_key'])
 
     def calculate_actual_points(self, wr_data):
         """Calculate actual PPR fantasy points for historical data."""
@@ -334,8 +351,8 @@ class WRInferenceEngine:
 
         return predictions, rationales
 
-    def run_inference(self, seasons=[2024], past_weeks=None, upcoming_season=2025, upcoming_week=1, use_ensemble=True, output_file=None):
-        """Run inference for at least 5 past weeks (with actual points) and upcoming week."""
+    def run_inference(self, seasons=[2024], past_weeks=None, upcoming_season=2025, upcoming_week=1, master_sheet_path=None, use_ensemble=True, output_file=None):
+        """Run inference for at least 5 past weeks and upcoming week with DK salaries."""
         print("🚀 WR Advanced Model Inference")
         print("=" * 50)
 
@@ -398,6 +415,27 @@ class WRInferenceEngine:
             output[f'predicted_points_{name}'] = pred
         output['shap_rationale'] = rationales
 
+        # Load DK salaries for 2025 Week 1
+        if master_sheet_path and upcoming_season and upcoming_week:
+            dk_salaries = self.load_dk_salaries(master_sheet_path, upcoming_season, upcoming_week)
+            # Match on player_id (primary) or join_key (fallback)
+            output = output.merge(
+                dk_salaries[['player_id', 'dk_salary', 'join_key']],
+                on=['player_id'],
+                how='left'
+            )
+            # For rows without player_id match, try join_key
+            unmatched = output[output['dk_salary'].isna() & (output['season'] == upcoming_season) & (output['week'] == upcoming_week)]
+            if not unmatched.empty:
+                output.loc[unmatched.index, 'join_key'] = output.loc[unmatched.index, 'player_name'].str.lower() + '|' + output.loc[unmatched.index, 'recent_team'] + '|WR'
+                output = output.drop(columns=['dk_salary']).merge(
+                    dk_salaries[['join_key', 'dk_salary']],
+                    on='join_key',
+                    how='left'
+                )
+            output['dk_salary'] = output['dk_salary'].fillna(0).astype(int)  # Zero for historical weeks or unmatched players
+            print(f"Matched {len(output[output['dk_salary'] > 0])} players with DK salaries for 2025 Week 1")
+
         # Sort by season, week, and ensemble predictions
         if 'ensemble' in predictions:
             output = output.sort_values(['season', 'week', 'predicted_points_ensemble'], ascending=[True, True, False])
@@ -411,8 +449,8 @@ class WRInferenceEngine:
             print(f"✅ Results saved to {output_file}")
 
         # Show top predictions
-        print(f"\nTop 15 WR predictions with actual points (where available) and SHAP rationales:")
-        display_cols = ['player_name', 'recent_team', 'season', 'week', 'actual_points', 'shap_rationale']
+        print(f"\nTop 15 WR predictions with actual points (where available), SHAP rationales, and DK salaries (2025 Week 1):")
+        display_cols = ['player_name', 'recent_team', 'season', 'week', 'actual_points', 'shap_rationale', 'dk_salary']
         display_cols.extend([f'predicted_points_{name}' for name in predictions.keys()])
         print(output[display_cols].head(15).to_string(index=False))
 
@@ -427,7 +465,8 @@ def main():
     parser.add_argument("--past-weeks", nargs='+', type=int, default=[13, 14, 15, 16, 17], help="Past weeks for actual points (defaults to 13-17)")
     parser.add_argument("--upcoming-season", type=int, default=2025, help="Season for upcoming week")
     parser.add_argument("--upcoming-week", type=int, default=1, help="Upcoming week to predict (defaults to 1)")
-    parser.add_argument("--output", default="wr_predictions_advanced.csv", help="Output file")
+    parser.add_argument("--master-sheet", default=r"C:\Users\ruley\NFLDFSMasterSheet\data\processed\master_sheet_2025.csv", help="Path to DK salary master sheet")
+    parser.add_argument("--output", default="wr_predictions_with_salaries.csv", help="Output file")
     parser.add_argument("--no-ensemble", action="store_true", help="Don't use ensemble predictions")
     args = parser.parse_args()
 
@@ -442,6 +481,7 @@ def main():
         past_weeks=args.past_weeks,
         upcoming_season=args.upcoming_season,
         upcoming_week=args.upcoming_week,
+        master_sheet_path=args.master_sheet,
         use_ensemble=not args.no_ensemble,
         output_file=args.output
     )

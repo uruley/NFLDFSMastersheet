@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Advanced WR Position Model Training Script
-Follows the same pattern as your QB model - uses nfl_data_py, multiple models, Optuna tuning
+Advanced TE Model Training Script (Fixed Version)
+Uses nfl_data_py, multiple models, Optuna tuning, lagged features, and current week target
 """
 import os
 import sys
@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import nfl_data_py as nfl
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import train_test_split, cross_val_score, TimeSeriesSplit
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.feature_selection import SelectKBest, f_regression, RFE
@@ -23,89 +23,92 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-def load_wr_data(seasons=[2020, 2021, 2022, 2023, 2024]):
-    """Load weekly WR data from NFL API."""
-    print(f"Loading WR data for seasons: {seasons}")
+def load_te_data(seasons=[2020, 2021, 2022, 2023, 2024]):
+    """Load weekly TE data from NFL API."""
+    print(f"Loading TE data for seasons: {seasons}")
     
     weekly_data = nfl.import_weekly_data(seasons)
-    wr_data = weekly_data[weekly_data['position'] == 'WR'].copy()
+    te_data = weekly_data[weekly_data['position'] == 'TE'].copy()
     
-    print(f"Loaded {len(wr_data)} WR weekly records")
-    print(f"Available columns: {list(wr_data.columns)}")
+    print(f"Loaded {len(te_data)} TE weekly records")
+    print(f"Available columns: {list(te_data.columns)}")
     
-    return wr_data
+    return te_data
 
-def prepare_features(wr_data):
-    """Prepare features for modeling, excluding non-numeric columns."""
-    print("Preparing features...")
+def create_lagged_features(te_data):
+    """Create lagged features for forecasting (previous week's stats)."""
+    print("Creating lagged features...")
     
-    # Get numeric columns only
-    numeric_cols = wr_data.select_dtypes(include=[np.number]).columns.tolist()
+    lag_cols = [
+        'receptions', 'targets', 'receiving_yards', 'receiving_tds', 'rushing_yards', 'carries',
+        'target_share', 'air_yards_share', 'wopr', 'receiving_epa', 'receiving_first_downs'
+    ]
     
-    # Remove columns that are not useful for prediction
-    exclude_cols = ['player_id', 'season', 'week', 'fantasy_points', 'fantasy_points_ppr']
-    feature_cols = [col for col in numeric_cols if col not in exclude_cols]
+    te_data = te_data.sort_values(['player_id', 'season', 'week'])
+    for col in lag_cols:
+        te_data[f'{col}_lag'] = te_data.groupby('player_id')[col].shift(1).fillna(0)
     
-    print(f"Selected {len(feature_cols)} numeric features")
-    return feature_cols
+    print("Lagged features created")
+    return te_data
 
-def create_derived_features(wr_data):
-    """Create derived features for WR modeling."""
+def create_derived_features(te_data):
+    """Create derived features using lagged stats."""
     print("Creating derived features...")
     
-    # Efficiency metrics
-    wr_data['catch_rate'] = (wr_data['receptions'] / wr_data['targets']).fillna(0)
-    wr_data['yards_per_reception'] = (wr_data['receiving_yards'] / wr_data['receptions']).fillna(0)
-    wr_data['yards_per_target'] = (wr_data['receiving_yards'] / wr_data['targets']).fillna(0)
-    wr_data['yards_per_rush'] = (wr_data['rushing_yards'] / wr_data['carries']).fillna(0)
+    # Use lagged stats for derivations to avoid leakage
+    te_data['catch_rate_lag'] = (te_data.get('receptions_lag', 0) / te_data.get('targets_lag', 1)).fillna(0)
+    te_data['yards_per_reception_lag'] = (te_data.get('receiving_yards_lag', 0) / te_data.get('receptions_lag', 1)).fillna(0)
+    te_data['yards_per_target_lag'] = (te_data.get('receiving_yards_lag', 0) / te_data.get('targets_lag', 1)).fillna(0)
+    te_data['yards_per_rush_lag'] = (te_data.get('rushing_yards_lag', 0) / te_data.get('carries_lag', 1)).fillna(0)
     
-    # Total metrics
-    wr_data['total_yards'] = wr_data['receiving_yards'] + wr_data['rushing_yards']
-    wr_data['total_tds'] = wr_data['receiving_tds'] + wr_data['rushing_tds']
-    wr_data['total_touches'] = wr_data['receptions'] + wr_data['carries']
+    te_data['total_yards_lag'] = te_data.get('receiving_yards_lag', 0) + te_data.get('rushing_yards_lag', 0)
+    te_data['total_touches_lag'] = te_data.get('receptions_lag', 0) + te_data.get('carries_lag', 0)
     
-    # Season progression
-    wr_data['early_season'] = (wr_data['week'] <= 4).astype(int)
-    wr_data['mid_season'] = ((wr_data['week'] > 4) & (wr_data['week'] <= 12)).astype(int)
-    wr_data['late_season'] = (wr_data['week'] > 12).astype(int)
-    wr_data['week_progression'] = wr_data['week'] / 18
+    # Assume red_zone_targets is available or derived; lag it
+    te_data['red_zone_targets_share_lag'] = te_data.get('red_zone_targets_lag', 0) / te_data.get('targets_lag', 1).clip(lower=1)
     
-    # Cap extreme values to prevent model issues
-    wr_data['catch_rate'] = wr_data['catch_rate'].clip(0, 1)
-    wr_data['yards_per_reception'] = wr_data['yards_per_reception'].clip(0, 50)
-    wr_data['yards_per_target'] = wr_data['yards_per_target'].clip(0, 50)
-    wr_data['yards_per_rush'] = wr_data['yards_per_rush'].clip(0, 20)
+    # Season progression (current week, no lag needed)
+    te_data['early_season'] = (te_data['week'] <= 4).astype(int)
+    te_data['mid_season'] = ((te_data['week'] > 4) & (te_data['week'] <= 12)).astype(int)
+    te_data['late_season'] = (te_data['week'] > 12).astype(int)
+    te_data['week_progression'] = te_data['week'] / 18
+    
+    # Cap extreme values
+    te_data['catch_rate_lag'] = te_data['catch_rate_lag'].clip(0, 1)
+    te_data['yards_per_reception_lag'] = te_data['yards_per_reception_lag'].clip(0, 50)
+    te_data['yards_per_target_lag'] = te_data['yards_per_target_lag'].clip(0, 50)
+    te_data['yards_per_rush_lag'] = te_data['yards_per_rush_lag'].clip(0, 20)
+    te_data['red_zone_targets_share_lag'] = te_data['red_zone_targets_share_lag'].clip(0, 1)
     
     print("Derived features created")
-    return wr_data
+    return te_data
 
-def encode_categorical_features(wr_data, feature_cols):
+def encode_categorical_features(te_data, feature_cols):
     """Encode categorical features for modeling."""
     print("Encoding categorical features...")
     
-    # Create encoders dictionary
     encoders = {}
     
     # Encode team
     team_encoder = LabelEncoder()
-    wr_data['team_encoded'] = team_encoder.fit_transform(wr_data['recent_team'].fillna('UNK'))
+    te_data['team_encoded'] = team_encoder.fit_transform(te_data['recent_team'].fillna('UNK'))
     encoders['team'] = team_encoder
     
     # Encode opponent team
     opponent_encoder = LabelEncoder()
-    wr_data['opponent_encoded'] = opponent_encoder.fit_transform(wr_data['opponent_team'].fillna('UNK'))
+    te_data['opponent_encoded'] = opponent_encoder.fit_transform(te_data['opponent_team'].fillna('UNK'))
     encoders['opponent'] = opponent_encoder
     
     # Encode season type
     season_type_encoder = LabelEncoder()
-    wr_data['season_type_encoded'] = season_type_encoder.fit_transform(wr_data['season_type'].fillna('REG'))
+    te_data['season_type_encoded'] = season_type_encoder.fit_transform(te_data['season_type'].fillna('REG'))
     encoders['season_type'] = season_type_encoder
     
     # Add encoded columns to feature list
     feature_cols.extend(['team_encoded', 'opponent_encoded', 'season_type_encoded'])
     
     print("Categorical features encoded")
-    return wr_data, feature_cols, encoders
+    return te_data, feature_cols, encoders
 
 def feature_selection(X, y, feature_names, k_best=20):
     """Perform feature selection using multiple methods."""
@@ -162,48 +165,40 @@ def objective_catboost(trial, X_train, y_train, X_val, y_val):
     """Optuna objective for CatBoost hyperparameter tuning."""
     params = {
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-        'depth': trial.suggest_int('depth', 4, 10),
-        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1.0, 10.0),
-        'border_count': trial.suggest_int('border_count', 32, 255),
+        'depth': trial.suggest_int('depth', 3, 10),
+        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 0.1, 10.0),
         'bagging_temperature': trial.suggest_float('bagging_temperature', 0.0, 1.0),
+        'random_strength': trial.suggest_float('random_strength', 1, 10),
     }
     
-    model = cb.CatBoostRegressor(**params, random_state=42, verbose=False)
-    model.fit(X_train, y_train)
+    model = cb.CatBoostRegressor(**params, random_state=42, verbose=0)
+    model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50, verbose=False)
     pred = model.predict(X_val)
     return np.sqrt(mean_squared_error(y_val, pred))
 
 def train_ensemble_models(X_train, y_train, X_val, y_val, feature_names):
-    """Train multiple models and create ensemble."""
-    print("\n=== TRAINING ENSEMBLE MODELS ===")
-    
+    """Train ensemble models with Optuna tuning."""
     models = {}
     predictions = {}
     metrics = {}
     
-    # 1. LightGBM with Optuna tuning
+    # 1. LightGBM with Optuna
     print("Tuning LightGBM...")
     study_lgb = optuna.create_study(direction='minimize')
-    study_lgb.optimize(lambda trial: objective_lightgbm(trial, X_train, y_train, X_val, y_val), 
-                       n_trials=50, show_progress_bar=True)
-    
+    study_lgb.optimize(lambda trial: objective_lightgbm(trial, X_train, y_train, X_val, y_val), n_trials=100)
     best_lgb_params = study_lgb.best_params
-    best_lgb_params.update({'objective': 'regression', 'metric': 'rmse', 'boosting_type': 'gbdt', 
-                           'n_estimators': 1000, 'random_state': 42, 'verbose': -1})
+    best_lgb_params.update({'random_state': 42, 'verbose': -1})
     
     lgb_model = lgb.LGBMRegressor(**best_lgb_params)
-    lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
-                  callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)])
+    lgb_model.fit(X_train, y_train)
     
     models['lightgbm'] = lgb_model
     predictions['lightgbm'] = lgb_model.predict(X_val)
     
-    # 2. CatBoost with Optuna tuning
+    # 2. CatBoost with Optuna
     print("Tuning CatBoost...")
     study_cb = optuna.create_study(direction='minimize')
-    study_cb.optimize(lambda trial: objective_catboost(trial, X_train, y_train, X_val, y_val), 
-                       n_trials=50, show_progress_bar=True)
-    
+    study_cb.optimize(lambda trial: objective_catboost(trial, X_train, y_train, X_val, y_val), n_trials=100)
     best_cb_params = study_cb.best_params
     best_cb_params.update({'objective': 'RMSE', 'eval_metric': 'RMSE', 
                           'iterations': 1000, 'random_state': 42, 'verbose': False})
@@ -261,7 +256,7 @@ def train_ensemble_models(X_train, y_train, X_val, y_val, feature_names):
     
     return models, predictions, metrics
 
-def save_models_and_artifacts(models, encoders, feature_names, metrics, output_dir):
+def save_models_and_artifacts(models, encoders, scaler, feature_names, metrics, output_dir):
     """Save all models and artifacts."""
     print(f"\nSaving models and artifacts to {output_dir}...")
     
@@ -280,6 +275,12 @@ def save_models_and_artifacts(models, encoders, feature_names, metrics, output_d
     with open(encoders_path, 'wb') as f:
         pickle.dump(encoders, f)
     print(f"Saved encoders to {encoders_path}")
+    
+    # Save scaler
+    scaler_path = output_path / "scaler.pkl"
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+    print(f"Saved scaler to {scaler_path}")
     
     # Save feature schema
     feature_schema = {
@@ -325,50 +326,58 @@ def save_models_and_artifacts(models, encoders, feature_names, metrics, output_d
 
 def main():
     """Main training function."""
-    print("🚀 Advanced WR Model Training")
+    print("🚀 Advanced TE Model Training (Fixed Version)")
     print("=" * 50)
     
     # Load data from NFL API
-    wr_data = load_wr_data()
+    te_data = load_te_data()
     
-    # Create derived features
-    wr_data = create_derived_features(wr_data)
+    # Create lagged features (to avoid leakage)
+    te_data = create_lagged_features(te_data)
     
-    # Prepare features
-    feature_cols = prepare_features(wr_data)
+    # Create derived features (using lagged stats)
+    te_data = create_derived_features(te_data)
+    
+    # Prepare features (now including lagged and derived)
+    feature_cols = [col for col in te_data.columns if '_lag' in col or col in ['early_season', 'mid_season', 'late_season', 'week_progression']]
     
     # Encode categorical features
-    wr_data, feature_cols, encoders = encode_categorical_features(wr_data, feature_cols)
+    te_data, feature_cols, encoders = encode_categorical_features(te_data, feature_cols)
     
-    # Create target variable (next week's fantasy points)
-    wr_data = wr_data.sort_values(["player_id", "season", "week"])
-    wr_data["fantasy_points_next"] = wr_data.groupby("player_id")["fantasy_points"].shift(-1)
+    # Target is current week's PPR points
+    te_data = te_data.dropna(subset=['fantasy_points_ppr'])  # Ensure no missing targets
+    y = te_data['fantasy_points_ppr']
     
-    # Filter out rows without next week's fantasy points
-    wr_data = wr_data.dropna(subset=["fantasy_points_next"])
+    X = te_data[feature_cols].fillna(0)
     
-    # Prepare feature matrix and target AFTER filtering
-    X = wr_data[feature_cols].fillna(0)
-    y = wr_data["fantasy_points_next"]
-    
-    print(f"Records with next week data: {len(y)}")
-    
-    print(f"\nFeature matrix shape: {X.shape}")
+    print(f"Feature matrix shape: {X.shape}")
     print(f"Target range: {y.min():.1f} to {y.max():.1f}")
     
-    # Split data
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+    # Chronological split to prevent leakage (train on earlier data, test on later)
+    te_data['season_week'] = te_data['season'] * 100 + te_data['week']
+    train_idx = te_data['season_week'] < 202300  # Before 2023
+    val_idx = (te_data['season_week'] >= 202300) & (te_data['season_week'] < 202400)  # 2023
+    test_idx = te_data['season_week'] >= 202400  # 2024
+    
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
     
     print(f"Train: {X_train.shape[0]}, Val: {X_val.shape[0]}, Test: {X_test.shape[0]}")
     
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    X_test_scaled = scaler.transform(X_test)
+    
     # Feature selection
-    selected_features, _, feature_importance = feature_selection(X_train, y_train, feature_cols)
+    selected_features, _, feature_importance = feature_selection(X_train_scaled, y_train, feature_cols)
     
     # Use selected features
-    X_train_selected = X_train[selected_features]
-    X_val_selected = X_val[selected_features]
-    X_test_selected = X_test[selected_features]
+    X_train_selected = pd.DataFrame(X_train_scaled, columns=feature_cols)[selected_features]
+    X_val_selected = pd.DataFrame(X_val_scaled, columns=feature_cols)[selected_features]
+    X_test_selected = pd.DataFrame(X_test_scaled, columns=feature_cols)[selected_features]
     
     print(f"\nUsing {len(selected_features)} selected features")
     
@@ -378,8 +387,8 @@ def main():
     )
     
     # Save everything
-    output_dir = "WRModel_Advanced"
-    save_models_and_artifacts(models, encoders, selected_features, metrics, output_dir)
+    output_dir = "TEModel_Advanced"
+    save_models_and_artifacts(models, encoders, scaler, selected_features, metrics, output_dir)
     
     print(f"\n🎯 TRAINING COMPLETE!")
     print(f"Models saved to: {output_dir}")

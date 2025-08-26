@@ -1,0 +1,449 @@
+Roundrobing: who has a solution for training our DFS model for the DST postion: We have been using the NFL_data_api for stats but i dont think they list DST specifically, we need to know how draft kings calculates DST points, here is a list of team defensive stats on our nfl data api: NFL API (Individual) + External (Team) = Complete DST Features
+     ↓                    ↓
+• Sacks per game      • Points allowed
+• INTs per game       • Yards allowed  
+• Fumble recoveries   • Opponent strength
+• Special teams TDs   • Home/Away context
+
+GPT:
+
+lright — here’s a patched DST training script that only relies on nfl_data_py and builds opponent-offense features automatically. It will:
+
+Pull weekly data for both defenses and offenses.
+
+Construct DST performance features (sacks, turnovers, points allowed).
+
+Merge in opponent offensive weakness (sacks taken, interceptions, fumbles lost, points scored).
+
+Add rolling averages (3-week, 5-week) for both DST and opponent offense.
+
+Train an ensemble of models and save artifacts.
+
+#!/usr/bin/env python3
+"""
+DST Model Training Script (NFL API only)
+Builds team-defense dataset using opponent offensive features
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import nfl_data_py as nfl
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import lightgbm as lgb
+import catboost as cb
+from sklearn.metrics import mean_squared_error, r2_score
+import pickle, json, warnings
+warnings.filterwarnings('ignore')
+
+# -------------------
+# Data Loading
+# -------------------
+def load_dst_dataset(seasons=[2020,2021,2022,2023,2024]):
+    print(f"Loading weekly data for seasons {seasons}...")
+    weekly = nfl.import_weekly_data(seasons)
+
+    # Defense performance: group by (season,week,def_team)
+    dst_perf = (weekly.groupby(['season','week','opponent_team'], as_index=False)
+                .agg({
+                    'sacks':'sum',
+                    'interceptions':'sum',
+                    'fumbles_lost':'sum',  # forced fumbles
+                    'passing_yards':'sum',
+                    'rushing_yards':'sum',
+                    'passing_tds':'sum',
+                    'rushing_tds':'sum',
+                    'fantasy_points':'sum'
+                })
+                .rename(columns={'opponent_team':'team'}))
+
+    # Fantasy DST scoring (simplified DK-ish)
+    dst_perf['fantasy_points_dst'] = (
+        dst_perf['sacks']*1 +
+        dst_perf['interceptions']*2 +
+        dst_perf['fumbles_lost']*2 -
+        (dst_perf['fantasy_points']*0.1)  # proxy penalty for points allowed
+    )
+
+    # Offense weakness: group by (season,week,team) = offense stats
+    off_stats = (weekly.groupby(['season','week','team'], as_index=False)
+                 .agg({
+                     'sacks':'sum',
+                     'interceptions':'sum',
+                     'fumbles_lost':'sum',
+                     'passing_yards':'sum',
+                     'rushing_yards':'sum',
+                     'passing_tds':'sum',
+                     'rushing_tds':'sum',
+                     'fantasy_points':'sum'
+                 })
+                 .rename(columns={'team':'opp_team'}))
+
+    # Merge defense with opponent’s offense that week
+    df = dst_perf.merge(off_stats,
+                        left_on=['season','week','team'],
+                        right_on=['season','week','opp_team'],
+                        suffixes=('_def','_off'))
+
+    return df
+
+# -------------------
+# Feature Engineering
+# -------------------
+def build_features(df):
+    df = df.copy()
+
+    # Rolling averages (3- and 5-week) for defense
+    for col in ['sacks_def','interceptions_def','fumbles_lost_def','fantasy_points_dst']:
+        df[f'{col}_avg3'] = df.groupby('team')[col].transform(lambda x: x.shift(1).rolling(3,min_periods=1).mean())
+        df[f'{col}_avg5'] = df.groupby('team')[col].transform(lambda x: x.shift(1).rolling(5,min_periods=1).mean())
+
+    # Rolling averages for opponent offense
+    for col in ['sacks_off','interceptions_off','fumbles_lost_off','fantasy_points_off']:
+        df[f'{col}_avg3'] = df.groupby('opp_team')[col].transform(lambda x: x.shift(1).rolling(3,min_periods=1).mean())
+        df[f'{col}_avg5'] = df.groupby('opp_team')[col].transform(lambda x: x.shift(1).rolling(5,min_periods=1).mean())
+
+    # Game progression
+    df['week_progression'] = df['week']/18
+
+    # Drop NaNs from rolling windows
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+# -------------------
+# Train Models
+# -------------------
+def train_models(df):
+    y = df['fantasy_points_dst']
+    X = df.drop(columns=['fantasy_points_dst','opp_team'])
+
+    models = {
+        'lightgbm': lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05),
+        'catboost': cb.CatBoostRegressor(verbose=0, iterations=500, learning_rate=0.05),
+        'random_forest': RandomForestRegressor(n_estimators=300, random_state=42),
+        'gradient_boosting': GradientBoostingRegressor(n_estimators=300, learning_rate=0.05)
+    }
+
+    trained = {}
+    for name, model in models.items():
+        print(f"Training {name}...")
+        model.fit(X, y)
+        preds = model.predict(X)
+        rmse = mean_squared_error(y, preds, squared=False)
+        r2 = r2_score(y, preds)
+        print(f"  {name}: RMSE={rmse:.3f}, R²={r2:.3f}")
+        trained[name] = model
+
+    return trained, list(X.columns)
+
+# -------------------
+# Save Artifacts
+# -------------------
+def save_artifacts(models, feature_names, out_dir="DSTModel"):
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    for name, model in models.items():
+        with open(out / f"{name}_model.pkl","wb") as f:
+            pickle.dump(model,f)
+
+    with open(out / "feature_schema.json","w") as f:
+        json.dump({"columns":feature_names}, f, indent=2)
+
+    print(f"✅ Saved models + schema to {out}")
+
+# -------------------
+# Main
+# -------------------
+def main():
+    df = load_dst_dataset()
+    feats = build_features(df)
+    models, feature_names = train_models(feats)
+    save_artifacts(models, feature_names)
+
+if __name__ == "__main__":
+    main()
+
+
+Grok:
+The provided script from the document is a solid foundation for building and training a DST model using the nfl_data_py library, as it aggregates relevant defensive and opponent offensive stats from player-level weekly data. It also already incorporates training with multiple models/algorithms (LightGBM, CatBoost, Random Forest, and Gradient Boosting), which aligns with your request for using multiple "programs" (I assume meaning ensemble or varied ML approaches). However, the current fantasy_points_dst calculation is a rough proxy that doesn't fully match DraftKings' (DK) actual DST scoring rules—it underweights key elements like defensive/special teams touchdowns, safeties, blocks, and especially the tiered penalties/bonuses for points allowed, while using an arbitrary -0.1 multiplier on offensive fantasy points as a stand-in for points-allowed penalties.
+DraftKings DST Scoring Rules
+Based on official DK rules and standard NFL DFS scoring systems, here's how DK calculates DST fantasy points (note: these apply to the team defense/special teams unit as a whole per game):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CategoryPointsSack+1Interception+2Fumble Recovery+2Blocked Punt, FG, or PAT+2Safety+2Defensive Touchdown (e.g., INT return, fumble return)+6Special Teams Touchdown (e.g., punt/kickoff/FG return TD)+62-Point Conversion Return+2
+Additionally, there are tiered bonuses/penalties based on total points allowed (PA) by the DST unit (excluding points from the team's own offense, like pick-sixes against their QB):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Points AllowedBonus/Penalty0+101-6+77-13+414-20+121-27028-34-135+-4 
+DK does not award bonuses or penalties for yards allowed (unlike some other platforms like FanDuel), so focusing on points allowed, turnovers, sacks, and scores is key.
+Proposed Improvements and Solution
+To make the model more accurate for DK DFS, I propose modifying the script to:
+
+Incorporate actual DK scoring: Replace the proxy with a function that calculates DST points based on the full rules above. However, the current weekly player data lacks some details (e.g., blocked kicks, safeties, specific TD types). We can approximate closely using available stats like interceptions, fumbles_lost (as recoveries), sacks, and add points allowed from schedule data.
+Add schedule data for points allowed: Use nfl.import_schedules() to get game outcomes and calculate exact points allowed per game, then apply the tiered scoring.
+Enhance features: Include more context like home/away (from schedule), opponent strength (e.g., via implied totals or Vegas lines, if you can integrate an external API), and rolling averages for points allowed.
+Train with additional models: The script already uses 4 strong ones, but we can add XGBoost (via xgboost library, assuming it's available in your env or installable) for diversity.
+Handle missing advanced stats: For full accuracy (e.g., blocked kicks, exact defensive TDs), switch to play-by-play data via nfl.import_pbp_data(), but that increases complexity and runtime. Start with this improved version using weekly + schedule data.
+
+Here's an updated Python script incorporating these changes. I've commented on key modifications. Run it in your environment with nfl_data_py installed.
+python#!/usr/bin/env python3
+"""
+Improved DST Model Training Script (NFL API only)
+Builds team-defense dataset using opponent offensive features and actual DK scoring
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import nfl_data_py as nfl
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import lightgbm as lgb
+import catboost as cb
+import xgboost as xgb  # Added for extra model diversity
+from sklearn.metrics import mean_squared_error, r2_score
+import pickle, json, warnings
+warnings.filterwarnings('ignore')
+
+# -------------------
+# Data Loading
+# -------------------
+def load_dst_dataset(seasons=[2020,2021,2022,2023,2024]):
+    print(f"Loading weekly data for seasons {seasons}...")
+    weekly = nfl.import_weekly_data(seasons)
+    
+    # Load schedule data for points allowed and home/away
+    print(f"Loading schedule data for seasons {seasons}...")
+    schedule = nfl.import_schedules(seasons)
+    schedule = schedule[['season', 'week', 'home_team', 'away_team', 'home_score', 'away_score']]
+    schedule['home_points_allowed'] = schedule['away_score']  # Points allowed by home team (defense)
+    schedule['away_points_allowed'] = schedule['home_score']  # Points allowed by away team (defense)
+
+    # Defense performance: group by (season,week,opponent_team) -> defense stats
+    dst_perf = (weekly.groupby(['season','week','opponent_team'], as_index=False)
+                .agg({
+                    'sacks':'sum',
+                    'interceptions':'sum',
+                    'fumbles_lost':'sum',  # Proxy for recoveries
+                    'passing_yards':'sum',
+                    'rushing_yards':'sum',
+                    'passing_tds':'sum',
+                    'rushing_tds':'sum',
+                    'fantasy_points':'sum'  # Offense FP, for proxy if needed
+                })
+                .rename(columns={'opponent_team':'team'}))
+
+    # Offense stats: group by (season,week,team)
+    off_stats = (weekly.groupby(['season','week','team'], as_index=False)
+                 .agg({
+                     'sacks':'sum',
+                     'interceptions':'sum',
+                     'fumbles_lost':'sum',
+                     'passing_yards':'sum',
+                     'rushing_yards':'sum',
+                     'passing_tds':'sum',
+                     'rushing_tds':'sum',
+                     'fantasy_points':'sum'
+                 })
+                 .rename(columns={'team':'opp_team'}))
+
+    # Merge defense with opponent offense
+    df = dst_perf.merge(off_stats,
+                        left_on=['season','week','team'],
+                        right_on=['season','week','opp_team'],
+                        suffixes=('_def','_off'))
+
+    # Merge with schedule to add points allowed and home/away
+    # First, create two versions of schedule: one for home, one for away
+    home_sched = schedule.rename(columns={'home_team':'team', 'away_team':'opp_team', 'home_points_allowed':'points_allowed'})
+    home_sched['home_away'] = 'home'
+    away_sched = schedule.rename(columns={'away_team':'team', 'home_team':'opp_team', 'away_points_allowed':'points_allowed'})
+    away_sched['home_away'] = 'away'
+    full_sched = pd.concat([home_sched, away_sched])[['season', 'week', 'team', 'opp_team', 'points_allowed', 'home_away']]
+
+    df = df.merge(full_sched, on=['season', 'week', 'team', 'opp_team'])
+
+    # Calculate DK-style fantasy points for DST
+    df['fantasy_points_dst'] = calculate_dk_dst_points(df)
+
+    return df
+
+# New function for DK DST scoring
+def calculate_dk_dst_points(df):
+    # Basic stats
+    points = (
+        df['sacks_def'] * 1 +
+        df['interceptions_def'] * 2 +
+        df['fumbles_lost_def'] * 2  # Proxy for recoveries; add safeties/blocks if PBP data added later
+    )
+    
+    # Points allowed tiers (add defensive/special TDs if available)
+    def pa_bonus(pa):
+        if pa == 0: return 10
+        elif 1 <= pa <= 6: return 7
+        elif 7 <= pa <= 13: return 4
+        elif 14 <= pa <= 20: return 1
+        elif 21 <= pa <= 27: return 0
+        elif 28 <= pa <= 34: return -1
+        else: return -4
+    
+    points += df['points_allowed'].apply(pa_bonus)
+    
+    # TODO: Add +6 for def/ST TDs, +2 for blocks/safeties via PBP if expanded
+    return points
+
+# -------------------
+# Feature Engineering
+# -------------------
+def build_features(df):
+    df = df.copy()
+
+    # Encode home/away
+    df['is_home'] = (df['home_away'] == 'home').astype(int)
+
+    # Rolling averages (3- and 5-week) for defense
+    for col in ['sacks_def','interceptions_def','fumbles_lost_def','fantasy_points_dst', 'points_allowed']:
+        df[f'{col}_avg3'] = df.groupby('team')[col].transform(lambda x: x.shift(1).rolling(3,min_periods=1).mean())
+        df[f'{col}_avg5'] = df.groupby('team')[col].transform(lambda x: x.shift(1).rolling(5,min_periods=1).mean())
+
+    # Rolling averages for opponent offense
+    for col in ['sacks_off','interceptions_off','fumbles_lost_off','fantasy_points_off']:
+        df[f'{col}_avg3'] = df.groupby('opp_team')[col].transform(lambda x: x.shift(1).rolling(3,min_periods=1).mean())
+        df[f'{col}_avg5'] = df.groupby('opp_team')[col].transform(lambda x: x.shift(1).rolling(5,min_periods=1).mean())
+
+    # Game progression
+    df['week_progression'] = df['week']/18
+
+    # Drop NaNs from rolling windows
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+# -------------------
+# Train Models
+# -------------------
+def train_models(df):
+    y = df['fantasy_points_dst']
+    X = df.drop(columns=['fantasy_points_dst','opp_team', 'home_away'])  # Drop non-numeric
+
+    models = {
+        'lightgbm': lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05),
+        'catboost': cb.CatBoostRegressor(verbose=0, iterations=500, learning_rate=0.05),
+        'random_forest': RandomForestRegressor(n_estimators=300, random_state=42),
+        'gradient_boosting': GradientBoostingRegressor(n_estimators=300, learning_rate=0.05),
+        'xgboost': xgb.XGBRegressor(n_estimators=500, learning_rate=0.05, random_state=42)  # Added for more diversity
+    }
+
+    trained = {}
+    for name, model in models.items():
+        print(f"Training {name}...")
+        model.fit(X, y)
+        preds = model.predict(X)
+        rmse = mean_squared_error(y, preds, squared=False)
+        r2 = r2_score(y, preds)
+        print(f"  {name}: RMSE={rmse:.3f}, R²={r2:.3f}")
+        trained[name] = model
+
+    return trained, list(X.columns)
+
+# -------------------
+# Save Artifacts
+# -------------------
+def save_artifacts(models, feature_names, out_dir="ImprovedDSTModel"):
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    for name, model in models.items():
+        with open(out / f"{name}_model.pkl","wb") as f:
+            pickle.dump(model,f)
+
+    with open(out / "feature_schema.json","w") as f:
+        json.dump({"columns":feature_names}, f, indent=2)
+
+    print(f"✅ Saved models + schema to {out}")
+
+# -------------------
+# Main
+# -------------------
+def main():
+    df = load_dst_dataset()
+    feats = build_features(df)
+    models, feature_names = train_models(feats)
+    save_artifacts(models, feature_names)
+
+if __name__ == "__main__":
+    main()
+Next Steps and Notes

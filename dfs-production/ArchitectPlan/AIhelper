@@ -1,0 +1,301 @@
+🏗️ DFS AI Model Build Overview (Startup Script)
+🎯 Current State
+
+You now have working pipelines for multiple positions:
+
+QB / WR / RB / TE models → trained on NFL API weekly stats, outputting projections.
+
+DST model (in progress) → uses NFL API + schedule, with Grok’s patch moving toward DraftKings scoring fidelity.
+
+Ensemble inference → LightGBM, CatBoost, Random Forest, Gradient Boosting (plus XGBoost for DST).
+
+Inference scripts (infer_wr_advanced.py) generate CSVs with:
+
+Historical actuals (for backtesting).
+
+Future projections (placeholders for now).
+
+SHAP rationales (showing why the model made each prediction).
+
+🛠️ Issues Encountered & Fixes
+WR Model
+
+Problem: Early versions produced flat, unrealistic projections.
+
+Fix: Added SHAP explainability, ensemble weighting, and improved derived features (catch rate, yards per target, etc.).
+
+Status: Now generates varied, realistic projections and includes rationales
+.
+
+TE Model
+
+Problem: All predictions ~3–4 points (lagged features mismatch).
+
+Cause: Not loading prior-week data when creating lagged features, leading to all-zero inputs.
+
+Fix:
+
+Load one extra week before inference (e.g., load wk 12 if predicting wk 13).
+
+Add prediction_week flag to separate lagged vs prediction rows.
+
+Align feature counts (scaler vs model).
+
+Status: Fixed — produces realistic, varied projections again.
+
+QB Model
+
+Problem: Caps on predictions (masking underlying issues).
+
+Fix: Refactored to remove caps, focused on realistic feature inputs instead.
+
+Status: Now outputs full range of QB outcomes.
+
+DST Model
+
+Problem: Initial proxy scoring didn’t reflect DK rules.
+
+Fix (Grok’s patch):
+
+Pulled schedule data for true points allowed.
+
+Added DK tiered points-allowed scoring.
+
+Added home/away context.
+
+Next: Integrate safeties, blocked kicks, and return TDs via nfl.import_pbp_data().
+
+📂 Standard Project Structure
+
+Each position model follows the same structure:
+
+PositionModel/
+  QB/
+    train_qb_model.py
+    infer_qb.py
+  WR/
+    train_wr_model.py
+    infer_wr_advanced.py
+  TE/
+    train_te_model.py
+    infer_te.py
+  RB/
+    ...
+  DST/
+    train_dst_model.py
+    infer_dst.py
+
+
+Artifacts (saved in each model directory):
+
+*_model.pkl → trained model files.
+
+encoders.pkl → categorical encoders.
+
+feature_schema.json → list of feature columns (ensures inference/training match).
+
+🔄 Workflow for New Model Builds
+
+Training:
+
+Load NFL API data (import_weekly_data).
+
+Build features (include lagged averages, opponent context).
+
+Train ensemble (LightGBM, CatBoost, RF, GBM; XGB optional).
+
+Save models + schema.
+
+Inference:
+
+Load historical (for validation) + upcoming slate (placeholder until crosswalk/real slate integration).
+
+Prepare features (align with schema).
+
+Run ensemble predictions + SHAP.
+
+Save projections CSV.
+
+Validation:
+
+Compare predictions vs actual_points (backtest).
+
+Calibrate if necessary (linear adjustment layer).
+
+Check correlation across positions (QB ↔ WR/RB).
+
+🚀 Next Steps
+
+Unify projections: Build a master_merge.py that joins all position projections into one CSV keyed by (season, week, player_id).
+
+Lineup optimizer: Already exists — feed it unified projections.
+
+Real-time AI Coach (Phase 2): Add adjustment layer on top of projections (injuries, weather, Vegas moves).
+
+Future DST Upgrade: Use import_pbp_data for complete DK scoring fidelity.
+
+🏗️ DFS Model Starter Template
+
+This is the boilerplate you can copy into train_position_model.py and infer_position_model.py for any new position (e.g., DST, K, FLEX).
+
+🔧 Training Script (train_position_model.py)
+#!/usr/bin/env python3
+"""
+Generic DFS Model Training Script
+Replace POSITION with QB/RB/WR/TE/DST
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import nfl_data_py as nfl
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import lightgbm as lgb
+import catboost as cb
+import pickle, json, warnings
+from sklearn.metrics import mean_squared_error, r2_score
+
+warnings.filterwarnings("ignore")
+
+def load_position_data(seasons=[2020,2021,2022,2023,2024]):
+    """Load weekly data for a given position"""
+    weekly = nfl.import_weekly_data(seasons)
+    df = weekly[weekly["position"] == "POSITION"].copy()
+    return df
+
+def build_features(df):
+    """Feature engineering for training"""
+    df = df.copy()
+    # Example derived features
+    df["week_progression"] = df["week"] / 18
+    # TODO: add position-specific rolling averages, ratios, etc.
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+def train_models(df, target_col="fantasy_points_ppr"):
+    """Train ensemble models"""
+    y = df[target_col]
+    X = df.drop(columns=[target_col])
+
+    models = {
+        "lightgbm": lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05),
+        "catboost": cb.CatBoostRegressor(verbose=0, iterations=500, learning_rate=0.05),
+        "random_forest": RandomForestRegressor(n_estimators=300, random_state=42),
+        "gradient_boosting": GradientBoostingRegressor(n_estimators=300, learning_rate=0.05),
+    }
+
+    trained = {}
+    for name, model in models.items():
+        print(f"Training {name}...")
+        model.fit(X, y)
+        preds = model.predict(X)
+        rmse = mean_squared_error(y, preds, squared=False)
+        r2 = r2_score(y, preds)
+        print(f"  {name}: RMSE={rmse:.3f}, R²={r2:.3f}")
+        trained[name] = model
+
+    return trained, list(X.columns)
+
+def save_artifacts(models, feature_names, out_dir="PositionModel"):
+    """Save trained models + schema"""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    for name, model in models.items():
+        with open(out / f"{name}_model.pkl", "wb") as f:
+            pickle.dump(model, f)
+
+    with open(out / "feature_schema.json", "w") as f:
+        json.dump({"columns": feature_names}, f, indent=2)
+
+def main():
+    df = load_position_data()
+    feats = build_features(df)
+    models, feature_names = train_models(feats)
+    save_artifacts(models, feature_names)
+
+if __name__ == "__main__":
+    main()
+
+🔍 Inference Script (infer_position_model.py)
+#!/usr/bin/env python3
+"""
+Generic DFS Model Inference Script
+Applies trained ensemble models for POSITION
+"""
+
+import pandas as pd
+import numpy as np
+import pickle, json
+from pathlib import Path
+import nfl_data_py as nfl
+
+class PositionInferenceEngine:
+    def __init__(self, model_dir="PositionModel"):
+        self.model_dir = Path(model_dir)
+        self.models = {}
+        self.feature_schema = {}
+        self.feature_names = []
+        self._load_models()
+        self._load_feature_schema()
+
+    def _load_models(self):
+        model_files = {
+            "lightgbm": "lightgbm_model.pkl",
+            "catboost": "catboost_model.pkl",
+            "random_forest": "random_forest_model.pkl",
+            "gradient_boosting": "gradient_boosting_model.pkl",
+        }
+        for name, filename in model_files.items():
+            path = self.model_dir / filename
+            if path.exists():
+                with open(path, "rb") as f:
+                    self.models[name] = pickle.load(f)
+                print(f"✅ Loaded {name}")
+            else:
+                print(f"⚠️ Missing: {filename}")
+
+    def _load_feature_schema(self):
+        schema_path = self.model_dir / "feature_schema.json"
+        with open(schema_path, "r") as f:
+            self.feature_schema = json.load(f)
+        self.feature_names = self.feature_schema["columns"]
+
+    def prepare_features(self, df):
+        """Align inference features with training schema"""
+        for col in self.feature_names:
+            if col not in df:
+                df[col] = 0
+        X = df[self.feature_names].fillna(0)
+        return X, df
+
+    def predict(self, df):
+        X, df = self.prepare_features(df)
+        preds = {name: model.predict(X) for name, model in self.models.items()}
+        preds["ensemble"] = np.mean(list(preds.values()), axis=0)
+        for name, arr in preds.items():
+            df[f"predicted_points_{name}"] = arr
+        return df
+
+def main():
+    # Example: upcoming slate placeholder
+    weekly = nfl.import_weekly_data([2025])
+    df = weekly[weekly["position"] == "POSITION"].copy()
+    
+    engine = PositionInferenceEngine()
+    output = engine.predict(df)
+    output.to_csv("position_predictions.csv", index=False)
+    print("✅ Predictions saved to position_predictions.csv")
+
+if __name__ == "__main__":
+    main()
+
+⚙️ How to Use This
+
+Copy both scripts into the new position’s folder (e.g. PositionModel/K/).
+
+Replace "POSITION" with the actual position (QB, WR, RB, TE, DST, or K).
+
+Adjust feature engineering in build_features() for that position (e.g., lagged targets for WR, opponent turnovers for DST).
+
+Train → save artifacts → run inference → get projections CSV.

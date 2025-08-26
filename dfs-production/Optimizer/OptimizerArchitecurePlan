@@ -1,0 +1,43 @@
+Implementation Plan
+Phase 1: Basic Linear Optimizer (Week 1)
+Build single lineup optimizer without correlations
+
+ Create lineup_optimizer.py with PuLP/CVXPY
+ Implement DraftKings constraints (50k salary, position requirements)
+ Test with Week 17 2024 data
+ Validate lineups meet all requirements
+
+Phase 2: Correlation Layer (Week 2)
+Add position correlations from historical data
+
+ Calculate correlations from 2022-2024 nfl_data_py
+ Store in data/correlations.json
+ Apply correlation adjustments to projections
+ Test correlation impact on lineup composition
+
+Phase 3: Stacking Rules (Week 3)
+Implement DFS stacking strategies
+
+ Add QB-WR stack enforcement
+ Add game stack logic (4+ from same game)
+ Add bring-back player logic
+ Test stack diversity across multiple lineups
+
+Phase 4: Multi-Lineup Generation (Week 4)
+Generate diverse lineup portfolio
+
+ Implement diversity constraints
+ Add exposure settings (max 50% for any player)
+ Generate 20-150 lineups for GPPs
+ Test uniqueness metrics
+
+Key Files
+optimizer/
+├── lineup_optimizer.py      # Core optimization logic
+├── correlations.py         # Calculate/apply correlations
+├── constraints.py          # Platform-specific rules
+├── stacking.py            # Stack building logic
+├── validator.py           # Lineup validation
+└── data/
+    ├── correlations.json  # Pre-calculated correlations
+    └── dk_settings.json   # DraftKings requirements

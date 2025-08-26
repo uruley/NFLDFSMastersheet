@@ -1,0 +1,19 @@
+QB Model Pipeline Verification - Complete Data Flow Analysis
+✅ Data Flow Verified - Here's How Everything Connects:---## 1. DATA SOURCES & INPUTS### 📊 DraftKings Slate (DKSalaries.csv) - Location: data/raw/DKSalaries.csv - Content: 722 players with positions, salaries, teams, game info - Format: CSV with columns: Position, Name, Salary, TeamAbbrev, Game Info, AvgPointsPerGame - Example: QB,Jayden Daniels,7000,WAS,NYG@WAS 09/07/2025 01:00PM ET,22.21### �� NFL API Historical Data - Source: nfl_data_py.import_weekly_data([2020, 2021, 2022, 2023, 2024]) - Content: 5 seasons of weekly player stats (completions, yards, TDs, etc.) - Used For: Training the model with historical performance data---## 2. CROSSWALK & PLAYER MATCHING### 🔗 Crosswalk File (crosswalk_2025.csv) - Location: data/processed/crosswalk_2025.csv - Purpose: Maps DraftKings names to standardized format - Key Column: join_key = clean_name|team|position - Example: jamarr chase|CIN|WR### 📋 Master Sheet (master_sheet_2025.csv) - Location: data/processed/master_sheet_2025.csv - Purpose: Contains player IDs and historical features - Key Columns: - join_key (for matching) - player_id (NFL API ID like 00-0036900) - Historical stats and features### 🔄 Matching Process
+---## 3. MODEL TRAINING PIPELINE### �� Training Script (train_qb_model.py) - Data Loading: NFL API data for seasons 2020-2024 - Feature Engineering: Creates lagged features (last 3, 5, 10 games) - Data Leakage Prevention: Uses shift(1) to ensure no current game data - Models Trained: LightGBM, CatBoost, Random Forest, Gradient Boosting - Output: Saved to QB_Model_Fixed/ directory### 🔧 Key Features Created - Lagged Stats: completions_avg_last_3, passing_yards_avg_last_5 - Efficiency Metrics: completion_rate_last_3, yards_per_attempt_last_3 - Context Features: early_season, is_home, week_progression---## 4. INFERENCE PIPELINE### 🚀 Inference Script (qb_inference.py) - Input: DraftKings slate + trained models - Process: 1. Load DraftKings slate 2. Match players to master sheet using crosswalk 3. Extract historical features for each QB 4. Run ensemble predictions through all 4 models 5. Apply salary-based adjustments 6. Output predictions with value metrics### 📊 Prediction Output
+
+DraftKings Slate (DKSalaries.csv)
+           ↓
+    Crosswalk (crosswalk_2025.csv)
+           ↓
+    Master Sheet (master_sheet_2025.csv)
+           ↓
+    Historical NFL API Data (2020-2024)
+           ↓
+    Model Training (train_qb_model.py)
+           ↓
+    Trained Models (QB_Model_Fixed/)
+           ↓
+    Inference (qb_inference.py)
+           ↓
+    Predictions (qb_predictions_fixed.csv)

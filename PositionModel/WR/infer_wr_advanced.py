@@ -103,34 +103,110 @@ class WRInferenceEngine:
         print(f"Available columns: {list(wr_data.columns)}")
         return wr_data
 
-    def load_upcoming_data(self, season=2025, week=1):
+    def load_upcoming_data(self, season=2025, week=1, master_sheet_path=None):
         """Load data for upcoming week with realistic current-week features."""
         print(f"Loading upcoming WR data for season {season}, week {week}")
-        # Placeholder: Replace with real API (e.g., SportsDataIO) for 2025 matchups
-        upcoming_data = pd.DataFrame({
-            'player_id': ['00-0037238', '00-0031381', '00-0039337', '00-0036972', '00-0036264'],
-            'player_name': ['D.London', 'D.Adams', 'M.Nabers', 'J.Jefferson', 'J.Chase'],
-            'recent_team': ['ATL', 'NYJ', 'NYG', 'MIN', 'CIN'],
-            'position': ['WR', 'WR', 'WR', 'WR', 'WR'],
-            'season': [season, season, season, season, season],
-            'week': [week, week, week, week, week],
-            'opponent_team': ['TB', 'SF', 'MIN', 'NYG', 'NE'],
-            'season_type': ['REG', 'REG', 'REG', 'REG', 'REG'],
-            # Realistic current-week features based on 2024 averages
-            'receptions': [5.5, 6.0, 5.0, 6.5, 6.0],
-            'targets': [8.0, 9.0, 7.5, 9.5, 8.5],
-            'receiving_yards': [65.0, 80.0, 60.0, 85.0, 75.0],
-            'receiving_tds': [0.4, 0.5, 0.3, 0.6, 0.5],
-            'rushing_yards': [0.0, 0.0, 5.0, 0.0, 0.0],
-            'carries': [0.0, 0.0, 0.5, 0.0, 0.0],
-            'target_share': [0.22, 0.25, 0.20, 0.28, 0.24],
-            'air_yards_share': [0.25, 0.30, 0.22, 0.35, 0.28],
-            'wopr': [0.40, 0.45, 0.38, 0.50, 0.43],
-            'receiving_epa': [2.0, 2.5, 1.8, 3.0, 2.3],
-            'receiving_first_downs': [3.0, 3.5, 2.8, 4.0, 3.2]
-        })
-        print(f"Loaded {len(upcoming_data)} upcoming WR records (placeholder)")
-        return upcoming_data
+        
+        if not master_sheet_path:
+            print("⚠️ No master sheet path provided, using placeholder data")
+            # Fallback to placeholder if no master sheet
+            upcoming_data = pd.DataFrame({
+                'player_id': ['00-0037238', '00-0031381', '00-0039337', '00-0036972', '00-0036264'],
+                'player_name': ['D.London', 'D.Adams', 'M.Nabers', 'J.Jefferson', 'J.Chase'],
+                'recent_team': ['ATL', 'NYJ', 'NYG', 'MIN', 'CIN'],
+                'position': ['WR', 'WR', 'WR', 'WR', 'WR'],
+                'season': [season, season, season, season, season],
+                'week': [week, week, week, week, week],
+                'opponent_team': ['TB', 'SF', 'MIN', 'NYG', 'NE'],
+                'season_type': ['REG', 'REG', 'REG', 'REG', 'REG'],
+                # Realistic current-week features based on 2024 averages
+                'receptions': [5.5, 6.0, 5.0, 6.5, 6.0],
+                'targets': [8.0, 9.0, 7.5, 9.5, 8.5],
+                'receiving_yards': [65.0, 80.0, 60.0, 85.0, 75.0],
+                'receiving_tds': [0.4, 0.5, 0.3, 0.6, 0.5],
+                'rushing_yards': [0.0, 0.0, 5.0, 0.0, 0.0],
+                'carries': [0.0, 0.0, 0.5, 0.0, 0.0],
+                'target_share': [0.22, 0.25, 0.20, 0.28, 0.24],
+                'air_yards_share': [0.25, 0.30, 0.22, 0.35, 0.28],
+                'wopr': [0.40, 0.45, 0.38, 0.50, 0.43],
+                'receiving_epa': [2.0, 2.5, 1.8, 3.0, 2.3],
+                'receiving_first_downs': [3.0, 3.5, 2.8, 4.0, 3.2]
+            })
+            print(f"Loaded {len(upcoming_data)} upcoming WR records (placeholder)")
+            return upcoming_data
+        
+        # --- Build 2025 Week 1 from latest 2024 features ---
+        print("Building 2025 Week 1 from latest 2024 features...")
+        
+        # 1) Get training feature list
+        if not self.feature_names:
+            print("⚠️ No feature schema loaded, using placeholder data")
+            return self.load_upcoming_data(season, week, None)  # Fallback to placeholder
+        
+        # 2) Build full 2024 feature table (same function used for backtest) 
+        #    and slice the *latest row per player*
+        print("Loading 2024 data and building features...")
+        wb_2024 = nfl.import_weekly_data([2024])
+        wr_2024 = wb_2024[wb_2024["position"] == "WR"].copy()
+        
+        # Build features using the same method as training
+        wr_2024 = self.create_derived_features(wr_2024)
+        wr_2024 = self.encode_categorical_features(wr_2024)
+        
+        # Get latest 2024 row per player
+        latest_2024 = (
+            wr_2024.sort_values(["player_id","season","week"])
+                     .groupby("player_id")
+                     .tail(1)
+        )
+        
+        # Keep only the columns the model expects (+ id)
+        feature_cols = [c for c in self.feature_names if c in latest_2024.columns]
+        latest_slice = latest_2024[["player_id"] + feature_cols].copy()
+        
+        # 3) Read Master Sheet and prefer its player_id
+        print(f"Loading master sheet from {master_sheet_path}")
+        dk = pd.read_csv(master_sheet_path)
+        dk_wr = dk[dk["Position"] == "WR"].copy()
+        
+        # If Master Sheet already has player_id, great; otherwise try crosswalk (optional)
+        if "player_id" not in dk_wr.columns or dk_wr["player_id"].isna().all():
+            try:
+                # optional fallback only if you want it
+                cw = pd.read_csv("../../data/processed/crosswalk_2025.csv")
+                cw["name_norm"] = cw["player_name"].str.lower().str.strip()
+                dk_wr["name_norm"] = dk_wr["Name"].str.lower().str.strip()
+                dk_wr = dk_wr.merge(
+                    cw[["player_id","recent_team","name_norm"]],
+                    on=["name_norm"], how="left"
+                )
+            except Exception:
+                pass  # keep going with whatever IDs we have
+        
+        # 4) Merge DK → latest feature slice by player_id
+        wk1 = dk_wr.merge(latest_slice, on="player_id", how="left")
+        
+        # 5) Stamp meta fields used downstream
+        wk1["season"] = season
+        wk1["week"] = week
+        wk1["season_type"] = "REG"
+        wk1["position"] = "WR"
+        wk1["recent_team"] = wk1.get("TeamAbbrev", wk1.get("recent_team", "UNK"))
+        wk1["player_name"] = wk1.get("Name", wk1.get("player_name", "Unknown"))
+        wk1["opponent_team"] = np.nan  # Will be filled by encoder with 'UNK'
+        wk1["actual_points"] = np.nan
+        
+        # 6) Median-fill any lag features that are still missing (rookies, new signings)
+        #    Use medians computed from *backtest* rows so distribution is realistic.
+        bt_full = wr_2024[feature_cols].copy()
+        med = bt_full.median(numeric_only=True)
+        for col in feature_cols:
+            if col not in wk1.columns:
+                wk1[col] = med.get(col, 0.0)
+        wk1[feature_cols] = wk1[feature_cols].fillna(med)
+        
+        print(f"✅ Built Week 1 data: {len(wk1)} WRs with {len(feature_cols)} features")
+        return wk1
 
     def load_dk_salaries(self, master_sheet_path, season, week):
         """Load DraftKings salaries from master sheet for specific season and week."""
@@ -190,27 +266,35 @@ class WRInferenceEngine:
     def encode_categorical_features(self, wr_data):
         """Encode categorical features using trained encoders."""
         print("Encoding categorical features...")
-        if 'team' in self.encoders:
-            team_encoder = self.encoders['team']
-            wr_data['team_encoded'] = wr_data['recent_team'].map(
-                lambda x: team_encoder.transform([x])[0] if x in team_encoder.classes_ else team_encoder.transform(['UNK'])[0]
-            )
+        
+        # Handle missing values first
+        if "season_type" in wr_data.columns:
+            wr_data["season_type"] = wr_data["season_type"].fillna("REG")
         else:
-            wr_data['team_encoded'] = 0
-        if 'opponent' in self.encoders:
-            opponent_encoder = self.encoders['opponent']
-            wr_data['opponent_encoded'] = wr_data['opponent_team'].map(
-                lambda x: opponent_encoder.transform([x])[0] if x in opponent_encoder.classes_ else opponent_encoder.transform(['UNK'])[0]
-            )
-        else:
-            wr_data['opponent_encoded'] = 0
-        if 'season_type' in self.encoders:
-            season_type_encoder = self.encoders['season_type']
-            wr_data['season_type_encoded'] = wr_data['season_type'].fillna('REG').map(
-                lambda x: season_type_encoder.transform([x])[0] if x in season_type_encoder.classes_ else season_type_encoder.transform(['REG'])[0]
-            )
-        else:
-            wr_data['season_type_encoded'] = 0
+            wr_data["season_type"] = "REG"
+        
+        # Map each encoder with fallback handling
+        for logical, key in [("recent_team","team"),("opponent_team","opponent"),("season_type","season_type")]:
+            if key in self.encoders:
+                le = self.encoders[key]
+                def map_one(x):
+                    if logical == "season_type" and (x is None or pd.isna(x)):
+                        s = "REG"
+                    else:
+                        s = str(x) if not pd.isna(x) else "UNK"
+                    # Try to transform, fallback to first class if unknown
+                    try:
+                        if s in le.classes_:
+                            return le.transform([s])[0]
+                        else:
+                            # Use first class as fallback for unknown labels
+                            return le.transform([le.classes_[0]])[0]
+                    except Exception:
+                        return 0
+                wr_data[f"{key}_encoded"] = wr_data[logical].map(map_one) if logical in wr_data.columns else 0
+            else:
+                wr_data[f"{key}_encoded"] = 0
+        
         print("Categorical features encoded")
         return wr_data
 
@@ -383,7 +467,7 @@ class WRInferenceEngine:
         # Load upcoming week data
         upcoming_data = pd.DataFrame()
         if upcoming_season and upcoming_week:
-            upcoming_data = self.load_upcoming_data(upcoming_season, upcoming_week)
+            upcoming_data = self.load_upcoming_data(upcoming_season, upcoming_week, master_sheet_path)
 
         # Combine datasets
         wr_data = pd.concat([historical_data, upcoming_data], ignore_index=True)
@@ -414,6 +498,64 @@ class WRInferenceEngine:
         for name, pred in predictions.items():
             output[f'predicted_points_{name}'] = pred
         output['shap_rationale'] = rationales
+        
+        # Add historical features for WRs (similar to RB model)
+        if 'targets' in wr_data.columns:
+            print("Calculating historical features for WRs...")
+            
+            # Calculate historical averages for each player
+            historical_features = []
+            for player_id in output['player_id'].unique():
+                player_data = wr_data[wr_data['player_id'] == player_id].copy()
+                if len(player_data) >= 3:  # Need at least 3 weeks of data
+                    # Sort by season and week to get most recent data first
+                    player_data = player_data.sort_values(['season', 'week'], ascending=[False, False])
+                    
+                    # Calculate 3-week and 5-week averages for available columns
+                    targets_l3 = player_data['targets'].head(3).mean() if 'targets' in player_data.columns else 0.0
+                    targets_l5 = player_data['targets'].head(5).mean() if 'targets' in player_data.columns else 0.0
+                    target_share_l3 = player_data['target_share'].head(3).mean() if 'target_share' in player_data.columns else 0.0
+                    
+                    # For WRs, we don't have routes, snaps, or route_share in the current model
+                    # So we'll set these to 0.0 for consistency with the expected schema
+                    routes_l3 = 0.0
+                    routes_l5 = 0.0
+                    snaps_l3 = 0.0
+                    snaps_l5 = 0.0
+                    route_share_l3 = 0.0
+                    
+                    # Add to historical features list
+                    historical_features.append({
+                        'player_id': player_id,
+                        'targets_l3': targets_l3,
+                        'targets_l5': targets_l5,
+                        'routes_l3': routes_l3,
+                        'routes_l5': routes_l5,
+                        'snaps_l3': snaps_l3,
+                        'snaps_l5': snaps_l5,
+                        'target_share_l3': target_share_l3,
+                        'route_share_l3': route_share_l3,
+                        'rz_tgts_2024': 0.0,  # Placeholder for red zone targets
+                        'rz_rush_2024': 0.0   # Placeholder for red zone rushes (WRs don't rush much)
+                    })
+            
+            # Create historical features DataFrame and merge with output
+            if historical_features:
+                hist_df = pd.DataFrame(historical_features)
+                output = output.merge(hist_df, on='player_id', how='left')
+                
+                # Fill NaN values with 0.0
+                hist_cols = ['targets_l3', 'targets_l5', 'routes_l3', 'routes_l5', 'snaps_l3', 'snaps_l5', 
+                           'target_share_l3', 'route_share_l3', 'rz_tgts_2024', 'rz_rush_2024']
+                for col in hist_cols:
+                    if col in output.columns:
+                        output[col] = output[col].fillna(0.0)
+                
+                print(f"✅ Added historical features for {len(historical_features)} WR players")
+            else:
+                print("⚠️ No historical features calculated (insufficient data)")
+        else:
+            print("⚠️ Missing required columns for historical features calculation")
 
         # Load DK salaries for 2025 Week 1
         if master_sheet_path and upcoming_season and upcoming_week:

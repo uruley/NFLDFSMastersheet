@@ -1,500 +1,518 @@
 #!/usr/bin/env python3
 """
-RB Model Inference Script
-Uses the advanced RB models to make predictions on DraftKings slate
+INFERENCE: RB (QB/WR-style)
+- Backtest: 2024 Wks 13–17 (predictions + actuals)
+- 2025 Wk1: use last 2024 lag row per player to seed features
+- DK merge via master sheet (preferred) → player_id
+- SHAP rationales; value = points / (Salary/1000)
+- Outputs: rb_predictions.csv
 """
 
-import pandas as pd
-import numpy as np
-import nfl_data_py as nfl
-import pickle
+import warnings, json, pickle, re
 import os
-import json
+from pathlib import Path
 
-def clean_name(name):
-    """Clean player name for matching."""
-    if pd.isna(name):
-        return ''
-    # Remove Jr., Sr., III, etc.
-    name = str(name).replace(' Jr.', '').replace(' Sr.', '').replace(' III', '').replace(' II', '').replace(' IV', '')
-    # Remove special characters and convert to lowercase
-    name = ''.join(c for c in name if c.isalnum() or c.isspace()).strip().lower()
-    return name
+import numpy as np
+import pandas as pd
+import nfl_data_py as nfl
 
-def norm_team(team):
-    """Normalize team abbreviation."""
-    if pd.isna(team):
-        return ''
-    return str(team).strip().upper()
+# Avoid Windows/joblib stalls when counting cores / spawning processes
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-def norm_pos(position):
-    """Normalize position."""
-    if pd.isna(position):
-        return ''
-    return str(position).strip().upper()
+warnings.filterwarnings("ignore")
 
-def load_dk_slate(slate_path):
-    """Load the DraftKings slate and prepare for master sheet matching."""
-    print(f"Loading DraftKings slate from {slate_path}")
-    
-    dk_slate = pd.read_csv(slate_path)
-    
-    # Filter for RBs only
-    rb_slate = dk_slate[dk_slate['Position'] == 'RB'].copy()
-    
-    # Define valid NFL team abbreviations (based on nfl_data_py and DK slate)
-    valid_teams = {
-        'ARI', 'ATL', 'BAL', 'BUF', 'CAR', 'CHI', 'CIN', 'CLE', 'DAL', 'DEN',
-        'DET', 'GB', 'HOU', 'IND', 'JAX', 'KC', 'LA', 'LAR', 'LAC', 'LV', 'MIA',
-        'MIN', 'NE', 'NO', 'NYG', 'NYJ', 'PHI', 'PIT', 'SEA', 'SF', 'TB',
-        'TEN', 'WAS'
-    }
-    
-    def extract_opponent(game_info, team_abbrev):
-        """Extract opponent from Game Info, avoiding self-matches."""
-        try:
-            # Split Game Info (e.g., CIN@CLE 09/07/2025 01:00PM ET)
-            teams = game_info.split(' ')[0].split('@')
-            if len(teams) != 2:
-                print(f"Warning: Malformed Game Info '{game_info}', defaulting to 'UNK'")
-                return 'UNK'
-            
-            team1, team2 = teams
-            
-            # Return the team that isn't the player's team
-            if team1 == team_abbrev:
-                opponent = team2
-            elif team2 == team_abbrev:
-                opponent = team1
-            else:
-                print(f"Warning: Player team '{team_abbrev}' not found in Game Info '{game_info}', defaulting to 'UNK'")
-                return 'UNK'
-            
-            # Validate opponent
-            if opponent not in valid_teams:
-                print(f"Warning: Opponent '{opponent}' not in valid teams, defaulting to 'UNK'")
-                return 'UNK'
-            
-            return opponent
-            
-        except Exception as e:
-            print(f"Error parsing Game Info '{game_info}': {e}, defaulting to 'UNK'")
-            return 'UNK'
-    
-    # Extract opponent using the improved function
-    if 'Game Info' in rb_slate.columns:
-        rb_slate['Opponent'] = rb_slate.apply(
-            lambda row: extract_opponent(row['Game Info'], row['TeamAbbrev']), axis=1
-        )
-    elif 'Opponent' in rb_slate.columns:
-        # If Opponent column already exists, validate it
-        rb_slate['Opponent'] = rb_slate['Opponent'].apply(
-            lambda x: x if x in valid_teams else 'UNK'
-        )
-    else:
-        print("Warning: No Game Info or Opponent column found, setting default opponent")
-        rb_slate['Opponent'] = 'UNK'
-    
-    print(f"Found {len(rb_slate)} RBs in the slate")
-    
-    # Prepare for master sheet matching - handle different name column formats
-    if 'Name' in rb_slate.columns:
-        name_col = 'Name'
-    elif 'Name + ID' in rb_slate.columns:
-        # Extract just the name part from "Name + ID" column
-        rb_slate['Name'] = rb_slate['Name + ID'].str.split(' (')[0]
-        name_col = 'Name'
-    else:
-        print("Warning: No Name column found")
-        name_col = 'Name'
-    
-    rb_slate['clean_name'] = rb_slate[name_col].apply(clean_name)
-    rb_slate['norm_team'] = rb_slate['TeamAbbrev'].apply(norm_team)
-    rb_slate['norm_pos'] = rb_slate['Position'].apply(norm_pos)
-    rb_slate['join_key'] = rb_slate['clean_name'] + "|" + rb_slate['norm_team'] + "|" + rb_slate['norm_pos']
-    
-    print("Prepared join keys for master sheet matching")
-    print("Sample join keys:", rb_slate['join_key'].head().tolist())
-    print("Sample opponents:", rb_slate['Opponent'].head().tolist())
-    
-    return rb_slate
+# =========================
+# CONFIG / PATHS
+# =========================
+# Only compute SHAP for LGBM (fast). Skip CatBoost/sklearn to avoid hangs.
+SHAP_MODELS = {"lightgbm"}
+DEFAULT_MODEL_DIR = "RB_Model"
+# Change if you keep master sheet somewhere else:
+DEFAULT_MASTER_SHEET = r"C:\Users\ruley\NFLDFSMasterSheet\data\processed\master_sheet_2025.csv"
+# Optional helpers (only used if master lacks player_id)
+DEFAULT_CROSSWALK = r"C:\Users\ruley\NFLDFSMasterSheet\data\processed\crosswalk_2025.csv"
+DEFAULT_ALIASES   = r"C:\Users\ruley\NFLDFSMasterSheet\data\xwalk\aliases.csv"
 
-def get_rb_features_from_master(master_row, current_season=2025, current_week=1, weekly_data=None):
-    """Get RB features from master sheet data for prediction."""
-    # Handle different column name formats from merged data
-    rb_name = master_row.get('Name_dk', master_row.get('Name', 'Unknown'))
-    player_id = master_row.get('player_id', None)  # This is the NFL API player_id from master sheet
-    
-    print(f"Getting features for {rb_name} (NFL API ID: {player_id})")
-    
-    try:
-        # Get recent RB data from NFL API using player_id if available
-        if pd.notna(player_id):
-            print(f"  Using player_id: {player_id}")
-            
-            # Use passed weekly_data if available, otherwise load it
-            if weekly_data is None:
-                weekly_data = nfl.import_weekly_data([2023, 2024])
-                print(f"  Loaded {len(weekly_data)} weekly records from NFL API")
-            else:
-                print(f"  Using cached weekly data with {len(weekly_data)} records")
-            
-            print(f"  Available columns: {list(weekly_data.columns)}")
-            
-            # Check if player_id column exists
-            if 'player_id' in weekly_data.columns:
-                rb_data = weekly_data[
-                    (weekly_data['position'] == 'RB') & 
-                    (weekly_data['player_id'] == player_id)
-                ].copy()
-                print(f"  Found {len(rb_data)} records for player_id {player_id}")
-                
-                # If no records found by player_id, try name/team matching as fallback
-                if len(rb_data) == 0:
-                    print(f"  No records found for player_id {player_id}, trying name/team matching...")
-                    rb_data = weekly_data[
-                        (weekly_data['position'] == 'RB') & 
-                        (weekly_data['recent_team'] == master_row.get('norm_team_master', 'UNK'))
-                    ].copy()
-                    
-                    # Filter by similar names if multiple matches
-                    if len(rb_data) > 1:
-                        rb_data = rb_data[
-                            rb_data['player_name'].str.contains(
-                                master_row.get('clean_name_master', '').split()[0], 
-                                case=False, 
-                                na=False
-                            )
-                        ]
-                        print(f"  After name filtering: {len(rb_data)} records")
-            else:
-                print("  Warning: 'player_id' column not found in NFL API data")
-                rb_data = pd.DataFrame()
-        else:
-            print(f"  No player_id available, trying name/team matching")
-            # Fallback: try to match by name and team
-            if weekly_data is None:
-                weekly_data = nfl.import_weekly_data([2023, 2024])
-            
-            rb_data = weekly_data[
-                (weekly_data['position'] == 'RB') & 
-                (weekly_data['recent_team'] == master_row.get('norm_team_master', 'UNK'))
-            ].copy()
-            
-            # Filter by similar names if multiple matches
-            if len(rb_data) > 1:
-                rb_data = rb_data[
-                    rb_data['player_name'].str.contains(
-                        master_row.get('clean_name_master', '').split()[0], 
-                        case=False, 
-                        na=False
-                    )
-                ]
-        
-        if len(rb_data) == 0:
-            print(f"No historical data found for {rb_name}, using league average features as fallback")
-            # Use league average for RBs as fallback
-            rb_data = weekly_data[weekly_data['position'] == 'RB'].copy()
-            avg_features = rb_data.mean(numeric_only=True)
-            print(f"Using league average features for {rb_name}")
-        else:
-            # Use player's recent data
-            recent_data = rb_data.sort_values(['season', 'week'], ascending=False).head(3)
-            avg_features = recent_data.mean(numeric_only=True)
-        
-        # Add current context
-        avg_features['season'] = current_season
-        avg_features['week'] = current_week
-        avg_features['opponent_team'] = master_row.get('Opponent', 'UNK')  # Get opponent from DK slate
-        
-        # Create derived features for RBs
-        avg_features['yards_per_carry'] = (avg_features['rushing_yards'] / avg_features['carries']) if avg_features['carries'] > 0 else 0
-        avg_features['yards_per_reception'] = (avg_features['receiving_yards'] / avg_features['receptions']) if avg_features['receptions'] > 0 else 0
-        avg_features['yards_per_touch'] = ((avg_features['rushing_yards'] + avg_features['receiving_yards']) / 
-                                          (avg_features['carries'] + avg_features['receptions'])) if (avg_features['carries'] + avg_features['receptions']) > 0 else 0
-        avg_features['total_yards'] = avg_features['rushing_yards'] + avg_features['receiving_yards']
-        avg_features['total_tds'] = avg_features['rushing_tds'] + avg_features['receiving_tds']
-        avg_features['total_touches'] = avg_features['carries'] + avg_features['receptions']
-        avg_features['touchdown_rate'] = (avg_features['total_tds'] / avg_features['total_touches']) if avg_features['total_touches'] > 0 else 0
-        
-        # Week of season patterns
-        avg_features['early_season'] = 1 if current_week <= 4 else 0
-        avg_features['mid_season'] = 1 if (current_week > 4 and current_week <= 12) else 0
-        avg_features['late_season'] = 1 if current_week > 12 else 0
-        avg_features['week_progression'] = current_week / 18
-        
-        # Add team context
-        avg_features['recent_team'] = master_row.get('norm_team_master', 'UNK')
-        
-        # Cap extreme values to prevent model issues
-        avg_features['yards_per_carry'] = min(max(avg_features['yards_per_carry'], 0), 15)
-        avg_features['yards_per_reception'] = min(max(avg_features['yards_per_reception'], 0), 25)
-        avg_features['yards_per_touch'] = min(max(avg_features['yards_per_touch'], 0), 20)
-        avg_features['touchdown_rate'] = min(max(avg_features['touchdown_rate'], 0), 1)
-        
-        print(f"Found {len(rb_data)} historical performances")
-        return avg_features
-        
-    except Exception as e:
-        print(f"Error getting features for {rb_name}: {e}")
-        return None
+# Team harmonization (DK → NFL API)
+TEAM_MAP = {
+    "JAC":"JAX","LA":"LAR","LAR":"LAR","STL":"LAR",
+    "OAK":"LVR","LV":"LVR","WSH":"WAS","WAS":"WAS",
+    # others map to themselves
+}
 
-def encode_rb_features(rb_features, encoders, feature_cols):
-    """Encode RB features for model prediction."""
-    print("Encoding features for model input...")
-    
-    # Mapping for DK slate to nfl_data_py team abbreviations
-    team_mapping = {
-        'LAR': 'LA',  # DraftKings uses LAR, nfl_data_py uses LA
-        'LVR': 'LV',  # DraftKings might use LVR for Las Vegas
-        # Add other mappings as needed
-    }
-    
-    feature_vector = []
-    
-    for feature in feature_cols:
-        if feature in rb_features:
-            feature_vector.append(rb_features[feature])
-        elif feature == 'team_encoded':
-            team = rb_features.get('recent_team', 'UNK')
-            # Apply team mapping if needed
-            team = team_mapping.get(team, team)
-            if 'team' in encoders and team in encoders['team'].classes_:
-                feature_vector.append(encoders['team'].transform([team])[0])
-            else:
-                print(f"Team {team} not in training data or encoder missing, using default encoding")
-                feature_vector.append(0)
-        elif feature == 'opponent_encoded':
-            opponent = rb_features.get('opponent_team', 'UNK')
-            # Apply team mapping if needed
-            opponent = team_mapping.get(opponent, opponent)
-            if 'opponent' in encoders and opponent in encoders['opponent'].classes_:
-                feature_vector.append(encoders['opponent'].transform([opponent])[0])
-            else:
-                print(f"Opponent {opponent} not in training data or encoder missing, using default encoding")
-                feature_vector.append(0)
-        elif feature == 'season_type_encoded':
-            feature_vector.append(0)  # Assume regular season
-        else:
-            feature_vector.append(0)
-    
-    return np.array(feature_vector).reshape(1, -1)
+def map_team(t: str) -> str:
+    s = str(t).upper()
+    return TEAM_MAP.get(s, s)
 
-def make_rb_predictions(matched_rbs, models, encoders, feature_cols, current_season=2025, current_week=1, weekly_data=None):
-    """Make predictions for all matched RBs using ensemble models."""
-    print("Making RB predictions...")
-    
-    predictions = []
-    
-    for _, rb_row in matched_rbs.iterrows():
-        # Handle different column name formats from merged data
-        rb_name = rb_row.get('Name_dk', 'Unknown')
-        team = rb_row.get('TeamAbbrev_dk', 'UNK')
-        salary = rb_row.get('Salary_dk', 0)
-        opponent = rb_row.get('Opponent', 'UNK')  # Get opponent from DK slate
-        player_id = rb_row.get('player_id', 'Unknown')  # NFL API player_id from master sheet
-        
-        print(f"\nProcessing {rb_name} ({team}) vs {opponent} - Salary: ${salary:,} - ID: {player_id}")
-        
-        # Get RB features
-        rb_features = get_rb_features_from_master(rb_row, current_season, current_week, weekly_data)
-        
-        if rb_features is None:
-            print(f"Could not get features for {rb_name} - skipping")
-            continue
-        
-        # Encode features
-        feature_vector = encode_rb_features(rb_features, encoders, feature_cols)
-        
-        # Make predictions with all models
-        model_predictions = {}
-        for model_name, model in models.items():
-            try:
-                pred = model.predict(feature_vector)[0]
-                model_predictions[model_name] = pred
-                print(f"  {model_name}: {pred:.2f} points")
-            except Exception as e:
-                print(f"  Error with {model_name}: {e}")
-                model_predictions[model_name] = 0
-        
-        # Calculate ensemble prediction (average of all models)
-        valid_predictions = [p for p in model_predictions.values() if p > 0]
-        if valid_predictions:
-            ensemble_prediction = np.mean(valid_predictions)
-            predicted_points = np.clip(ensemble_prediction, 0, 50)
-        else:
-            predicted_points = 0
-        
-        # Calculate value
-        value = (predicted_points / (salary / 1000)) if salary > 0 else 0
-        
-        predictions.append({
-            'Name': rb_name,
-            'Team': team,
-            'Opponent': opponent,
-            'Position': 'RB',
-            'Salary': salary,
-            'Player_ID': player_id,
-            'Predicted_Points': round(predicted_points, 2),
-            'Value': round(value, 3),
-            'Recent_Avg_Points': round(rb_features.get('fantasy_points', 0), 2),
-            'Recent_Avg_Yards': round(rb_features.get('total_yards', 0), 1),
-            'Recent_Avg_TDs': round(rb_features.get('total_tds', 0), 1),
-            'Match_Status': 'Matched' if pd.notna(player_id) else 'Unmatched',
-            'LightGBM': round(model_predictions.get('lightgbm', 0), 2),
-            'CatBoost': round(model_predictions.get('catboost', 0), 2),
-            'RandomForest': round(model_predictions.get('random_forest', 0), 2),
-            'GradientBoosting': round(model_predictions.get('gradient_boosting', 0), 2)
-        })
-        
-        print(f"  Ensemble Predicted: {predicted_points:.2f} points")
-        print(f"  Value: {value:.3f} pts/$1000")
-    
-    return pd.DataFrame(predictions)
+def norm_name(s: str) -> str:
+    if not isinstance(s, str): return ""
+    s = s.lower().strip()
+    s = re.sub(r"[.\'\-]", "", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-def load_models_and_encoders(models_dir):
-    """Load the trained models and encoders."""
-    print(f"Loading models from {models_dir}")
-    
+# =========================
+# LOAD ARTIFACTS
+# =========================
+def load_models(model_dir: Path):
     models = {}
-    encoders = None
-    
+    for name in ["lightgbm","catboost","random_forest","gradient_boosting"]:
+        p = model_dir / f"{name}_model.pkl"
+        if p.exists():
+            with open(p, "rb") as f:
+                models[name] = pickle.load(f)
+            print(f"✅ Loaded {name}")
+        else:
+            print(f"⚠️ Missing model: {p.name}")
+    return models
+
+def load_encoders(model_dir: Path):
+    enc = {}
+    p = model_dir / "encoders.pkl"
+    if p.exists():
+        with open(p, "rb") as f:
+            enc = pickle.load(f)
+        print("✅ Loaded encoders")
+    else:
+        print("⚠️ No encoders.pkl found; continuing without (will default to 0)")
+    return enc
+
+def load_schema(model_dir: Path):
+    p = model_dir / "feature_schema.json"
+    with open(p, "r") as f:
+        schema = json.load(f)
+    feat_cols = schema["columns"]
+    print(f"✅ Loaded schema with {len(feat_cols)} features")
+    return feat_cols
+
+# =========================
+# FEATURE ENGINEERING (same as training)
+# =========================
+LAG_BASE_COLS = [
+    "carries","rushing_yards","rushing_tds",
+    "receptions","targets","receiving_yards","receiving_tds",
+    "fantasy_points_ppr"
+]
+LAG_WINDOWS = (3, 5, 10)
+
+def add_rb_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["player_id","season","week"]).copy()
+    for col in LAG_BASE_COLS:
+        if col not in df.columns:
+            df[col] = 0.0
+        for k in LAG_WINDOWS:
+            df[f"{col}_avg_last_{k}"] = (
+                df.groupby("player_id")[col]
+                  .shift(1)
+                  .rolling(k, min_periods=1)
+                  .mean()
+            )
+    for k in LAG_WINDOWS:
+        ca = df.get(f"carries_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        ry = df.get(f"rushing_yards_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        rc = df.get(f"receptions_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        rcy = df.get(f"receiving_yards_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        touches = ca + rc
+        df[f"yards_per_carry_last_{k}"] = np.where(ca > 0, ry / ca, 0.0)
+        df[f"yards_per_reception_last_{k}"] = np.where(rc > 0, rcy / rc, 0.0)
+        df[f"touches_avg_last_{k}"] = touches
+        df[f"yards_per_touch_last_{k}"] = np.where(touches > 0, (ry + rcy) / touches, 0.0)
+
+    df["early_season"] = (df["week"] <= 4).astype(int)
+    df["mid_season"]   = ((df["week"] > 4) & (df["week"] <= 12)).astype(int)
+    df["late_season"]  = (df["week"] > 12).astype(int)
+    df["week_progression"] = df["week"] / 18.0
+    return df
+
+def apply_encoders(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
+    df = df.copy()
+    # season_type default
+    if "season_type" in df.columns:
+        df["season_type"] = df["season_type"].fillna("REG")
+    else:
+        df["season_type"] = "REG"
+    # map each encoder
+    for logical, key in [("recent_team","team"),("opponent_team","opponent"),("season_type","season_type")]:
+        if key in encoders:
+            le = encoders[key]
+            def map_one(x):
+                s = "REG" if (logical=="season_type" and (x is None or pd.isna(x))) else (str(x) if not pd.isna(x) else "UNK")
+                return le.transform([s if s in le.classes_ else "UNK"])[0]
+            df[f"{key}_encoded"] = df[logical].map(map_one) if logical in df.columns else 0
+        else:
+            df[f"{key}_encoded"] = 0
+    return df
+
+def prepare_X(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+    # ensure all schema cols exist
+    for c in feature_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+    return df[feature_cols].fillna(0.0)
+
+# =========================
+# SHAP utilities
+# =========================
+def shap_for_lightgbm(model, X):
     try:
-        # Load encoders
-        encoders_path = os.path.join(models_dir, "encoders.pkl")
-        with open(encoders_path, 'rb') as f:
-            encoders = pickle.load(f)
-        print("Encoders loaded successfully")
-        
-        # Load all models
-        model_files = {
-            'lightgbm': 'lightgbm_model.pkl',
-            'catboost': 'catboost_model.pkl',
-            'random_forest': 'random_forest_model.pkl',
-            'gradient_boosting': 'gradient_boosting_model.pkl'
-        }
-        
-        for model_name, filename in model_files.items():
-            model_path = os.path.join(models_dir, filename)
-            if os.path.exists(model_path):
-                with open(model_path, 'rb') as f:
-                    models[model_name] = pickle.load(f)
-                print(f"  {model_name} model loaded")
-            else:
-                print(f"  Warning: {filename} not found")
-        
-        if not models:
-            print("No models loaded!")
-            return None, None
-            
-        print(f"Loaded {len(models)} models successfully")
-        return models, encoders
-        
-    except Exception as e:
-        print(f"Error loading models/encoders: {e}")
+        sv = model.predict(X, pred_contrib=True)
+        base = sv[:, -1]
+        vals = sv[:, :-1]
+        return base, vals
+    except Exception:
         return None, None
 
-def main():
-    """Main function to run RB predictions."""
-    print("RB Model Inference Script (Advanced Ensemble)")
-    print("=" * 60)
-    
-    # Configuration
-    models_dir = "PositionModel/RB_Model_Advanced"
-    feature_cols_path = os.path.join(models_dir, "feature_info.json")
-    dk_slate_path = "../../data/raw/dk_slates/2025/DKSalaries_20250824.csv"  # Use 2025 DK slate to match master sheet
-    master_sheet_path = "../../data/processed/master_sheet_2025.csv"  # Use master sheet for matching
-    current_season = 2025
-    current_week = 1
-    
-    # Check if files exist
-    if not os.path.exists(models_dir):
-        print(f"Models directory not found: {models_dir}")
-        return
-    
-    if not os.path.exists(feature_cols_path):
-        print(f"Feature info file not found: {feature_cols_path}")
-        return
-    
-    if not os.path.exists(master_sheet_path):
-        print(f"Master sheet not found: {master_sheet_path}")
-        return
-    
-    # Load models and encoders
-    models, encoders = load_models_and_encoders(models_dir)
-    if models is None or encoders is None:
-        return
-    
-    # Load feature columns
-    with open(feature_cols_path, 'r') as f:
-        feature_info = json.load(f)
-        feature_cols = feature_info['feature_names']
-    
-    print(f"Loaded {len(feature_cols)} features for prediction")
-    
-    # Load master sheet
-    print(f"Loading master sheet from {master_sheet_path}")
-    master_sheet = pd.read_csv(master_sheet_path)
-    print(f"Loaded {len(master_sheet)} players from master sheet")
-    
-    # Load NFL weekly data once
-    print("Loading NFL weekly data (this may take a moment)...")
-    weekly_data = nfl.import_weekly_data([2023, 2024])
-    print(f"Loaded {len(weekly_data)} weekly records from NFL API")
-    
-    # Load DK slate
+def shap_for_catboost(model, X):
     try:
-        dk_slate = load_dk_slate(dk_slate_path)
-    except Exception as e:
-        print(f"Error loading DK slate: {e}")
-        return
+        import catboost as cb
+        pool = cb.Pool(X)
+        sv = model.get_feature_importance(type='ShapValues', data=pool)
+        base = sv[:, -1]
+        vals = sv[:, :-1]
+        return base, vals
+    except Exception:
+        return None, None
+
+def shap_for_sklearn_tree(model, X):
+    try:
+        import shap as shaplib
+        explainer = shaplib.TreeExplainer(model)
+        vals = explainer.shap_values(X)
+        base = np.full(X.shape[0], explainer.expected_value, dtype=float)
+        return base, vals
+    except Exception:
+        return None, None
+
+def ensemble_shap(shap_dict):
+    bases, vals = [], []
+    for b, v in shap_dict.values():
+        if b is not None and v is not None:
+            bases.append(b); vals.append(v)
+    if not bases:
+        return None, None
+    base_e = np.mean(np.vstack(bases), axis=0)
+    vals_e = np.mean(np.stack(vals, axis=0), axis=0)
+    return base_e, vals_e
+
+def top_rationales(X, feature_names, base, shap_vals, k=3, decimals=2):
+    if base is None or shap_vals is None:
+        return ["(no SHAP available)"] * len(X)
+    out = []
+    for i in range(len(X)):
+        contrib = shap_vals[i]
+        order = np.argsort(-np.abs(contrib))
+        tops = []
+        for j in order[:k]:
+            sign = "↑" if contrib[j] > 0 else "↓"
+            tops.append(f"{feature_names[j]} {sign} {abs(contrib[j]):.{decimals}f}")
+        pred = base[i] + contrib.sum()
+        out.append(f"~{pred:.1f} pts (base {base[i]:.1f}) • " + ", ".join(tops))
+    return out
+
+# =========================
+# DK mapping helpers
+# =========================
+def attach_player_id_from_master(dk_rb: pd.DataFrame) -> pd.DataFrame:
+    """If master has player_id, return dk_rb with that column."""
+    if "player_id" in dk_rb.columns and dk_rb["player_id"].notna().any():
+        return dk_rb
+    return dk_rb  # no-op; we’ll try crosswalk in the caller
+
+def try_crosswalk(dk_rb: pd.DataFrame, crosswalk_path: str, aliases_path: str | None) -> pd.DataFrame:
+    """Fallback mapping if master lacks ids."""
+    dk_rb = dk_rb.copy()
+    dk_rb["name_norm"] = dk_rb["Name"].map(norm_name)
+    dk_rb["team_norm"] = dk_rb["TeamAbbrev"].map(map_team)
+    dk_rb["pos_norm"]  = dk_rb["Position"].astype(str).str.upper()
+
+    try:
+        cross = pd.read_csv(crosswalk_path)
+        cross["name_norm"] = cross["player_name"].map(norm_name)
+        cross["team_norm"] = cross["recent_team"].map(map_team)
+        # primary
+        m = dk_rb.merge(
+            cross[["name_norm","team_norm","player_id"]],
+            on=["name_norm","team_norm"], how="left"
+        )
+    except Exception:
+        m = dk_rb.copy()
+        m["player_id"] = np.nan
+
+    # alias rescue
+    if aliases_path:
+        try:
+            aliases = pd.read_csv(aliases_path)
+            # guess alias column
+            name_col = next((c for c in ["alias","alt_name","player_name","name"] if c in aliases.columns), None)
+            if name_col:
+                aliases["name_norm"] = aliases[name_col].map(norm_name)
+                miss = m["player_id"].isna()
+                if miss.any():
+                    fill = m.loc[miss, ["name_norm"]].merge(
+                        aliases[["name_norm","player_id"]].drop_duplicates(),
+                        on="name_norm", how="left"
+                    )["player_id"].values
+                    m.loc[miss, "player_id"] = fill
+        except Exception:
+            pass
+
+    return m
+
+# =========================
+# MAIN INFERENCE
+# =========================
+def run_inference(
+    model_dir=DEFAULT_MODEL_DIR,
+    master_sheet_path=DEFAULT_MASTER_SHEET,
+    crosswalk_path=DEFAULT_CROSSWALK,
+    aliases_path=DEFAULT_ALIASES,
+    upcoming_season=2025, upcoming_week=1,
+    backtest_weeks=(13,14,15,16,17),
+    output_csv="rb_predictions.csv"
+):
+    print("=== RB Model Inference ===")
+    model_dir = Path(model_dir)
+
+    # Artifacts
+    models = load_models(model_dir)
+    encoders = load_encoders(model_dir)
+    feature_cols = load_schema(model_dir)
     
-    # Match DK slate with master sheet
-    print("Matching DK slate with master sheet...")
-    matched_rbs = pd.merge(
-        dk_slate, 
-        master_sheet[master_sheet['Position'] == 'RB'], 
-        on='join_key', 
-        how='inner',
-        suffixes=('_dk', '_master')
-    )
-    
-    print(f"Found {len(matched_rbs)} matched RBs")
-    
-    if len(matched_rbs) == 0:
-        print("No RBs matched between DK slate and master sheet")
-        return
-    
-    # Make predictions with cached weekly data
-    predictions = make_rb_predictions(matched_rbs, models, encoders, feature_cols, current_season, current_week, weekly_data)
-    
-    if predictions is not None and len(predictions) > 0:
-        print("\n" + "=" * 60)
-        print("PREDICTIONS COMPLETE")
-        print("=" * 60)
-        print(predictions.to_string(index=False))
-        
-        # Save predictions
-        output_path = "rb_predictions.csv"
-        predictions.to_csv(output_path, index=False)
-        print(f"\nPredictions saved to {output_path}")
-        
-        # Show top predictions by value
-        print("\n" + "=" * 60)
-        print("TOP 10 RBs BY VALUE (pts/$1000)")
-        print("=" * 60)
-        top_by_value = predictions.nlargest(10, 'Value')[['Name', 'Team', 'Opponent', 'Salary', 'Predicted_Points', 'Value']]
-        print(top_by_value.to_string(index=False))
-        
-        # Show top predictions by points
-        print("\n" + "=" * 60)
-        print("TOP 10 RBs BY PREDICTED POINTS")
-        print("=" * 60)
-        top_by_points = predictions.nlargest(10, 'Predicted_Points')[['Name', 'Team', 'Opponent', 'Salary', 'Predicted_Points', 'Value']]
-        print(top_by_points.to_string(index=False))
-        
+    # Make RF single-threaded to avoid loky stalls on Windows
+    rf = models.get("random_forest")
+    if rf is not None and hasattr(rf, "n_jobs"):
+        try:
+            rf.set_params(n_jobs=1)
+        except Exception:
+            try:
+                rf.n_jobs = 1
+            except Exception:
+                pass
+
+    # ---------------- Historical backtest (2024 w13-17) ----------------
+    print("Loading 2024 RB data for backtest...")
+    wk24 = nfl.import_weekly_data([2024])
+    rb24 = wk24[wk24["position"]=="RB"].copy()
+    rb24["actual_points"] = rb24["fantasy_points_ppr"].astype(float)
+
+    rb24 = add_rb_lag_features(rb24)
+    rb24 = apply_encoders(rb24, encoders)
+
+    backtest = rb24[rb24["week"].isin(backtest_weeks)].copy()
+    X_bt = prepare_X(backtest, feature_cols)
+
+    print("Generating backtest predictions...")
+    preds_bt = {}
+    shap_dict = {}
+    for name, model in models.items():
+        p = model.predict(X_bt)
+        preds_bt[name] = p
+
+        # SHAP: only for LightGBM (fast). Others = None to skip heavy compute.
+        if name in SHAP_MODELS:
+            base, vals = shap_for_lightgbm(model, X_bt)
+        else:
+            base, vals = (None, None)
+        shap_dict[name] = (base, vals)
+
+    # ensemble = simple mean
+    if preds_bt:
+        ensemble_bt = np.mean(np.vstack([v for v in preds_bt.values()]), axis=0)
+        preds_bt["ensemble"] = ensemble_bt
+        base_e, vals_e = ensemble_shap(shap_dict)
     else:
-        print("No predictions generated")
+        ensemble_bt = np.array([])
+        base_e, vals_e = (None, None)
+
+    backtest_out = backtest[[
+        "player_id","player_name","recent_team","position","season","week","actual_points"
+    ]].copy()
+    for name, v in preds_bt.items():
+        backtest_out[f"predicted_points_{name}"] = v
+    backtest_out["shap_rationale"] = top_rationales(X_bt, feature_cols, base_e, vals_e, k=3)
+
+    # ---------------- Upcoming Week 1 (2025) ----------------
+    print("Loading DK master sheet and building 2025 Wk1 rows...")
+    
+    # --- Build 2025 Week 1 from latest 2024 features ---
+    # 1) Get training feature list
+    with open(Path(model_dir) / "feature_schema.json", "r") as f:
+        feature_schema = json.load(f)
+    feature_names = feature_schema["columns"]
+
+    # 2) Build full 2024 feature table (same function used for backtest) 
+    #    and slice the *latest row per player*
+    wb_2024 = nfl.import_weekly_data([2024])
+    rb_2024 = wb_2024[wb_2024["position"] == "RB"].copy()
+    feat_2024 = add_rb_lag_features(rb_2024)                # <-- your existing feature builder
+    feat_2024 = apply_encoders(feat_2024, encoders)          # <-- add encoders to get encoded columns
+    latest_2024 = (
+        feat_2024.sort_values(["player_id","season","week"])
+                 .groupby("player_id")
+                 .tail(1)
+    )
+
+    # Keep only the columns the model expects (+ id)
+    latest_slice = latest_2024[["player_id"] + [c for c in feature_names if c in latest_2024.columns]].copy()
+
+    # 3) Read Master Sheet and prefer its player_id
+    dk = pd.read_csv(master_sheet_path)
+    dk_rb = dk[dk["Position"] == "RB"].copy()
+
+    # If Master Sheet already has player_id, great; otherwise try crosswalk (optional)
+    if "player_id" not in dk_rb.columns or dk_rb["player_id"].isna().all():
+        try:
+            # optional fallback only if you want it
+            cw = pd.read_csv("../../data/processed/crosswalk_2025.csv")
+            cw["name_norm"] = cw["player_name"].str.lower().str.strip()
+            dk_rb["name_norm"] = dk_rb["Name"].str.lower().str.strip()
+            dk_rb = dk_rb.merge(
+                cw[["player_id","recent_team","name_norm"]],
+                on=["name_norm"], how="left"
+            )
+        except Exception:
+            pass  # keep going with whatever IDs we have
+
+    # 4) Merge DK → latest feature slice by player_id
+    wk1 = dk_rb.merge(latest_slice, on="player_id", how="left")
+
+    # 5) Stamp meta fields used downstream
+    wk1["season"] = upcoming_season
+    wk1["week"] = upcoming_week
+    wk1["season_type"] = "REG"
+    wk1["position"] = "RB"
+    wk1["recent_team"] = wk1.get("TeamAbbrev", wk1.get("recent_team", "UNK"))
+    wk1["player_name"] = wk1.get("Name", wk1.get("player_name", "Unknown"))
+    wk1["opponent_team"] = np.nan  # Will be filled by encoder with 'UNK'
+    wk1["actual_points"] = np.nan
+    wk1["dk_salary"] = wk1["Salary"].astype(float)
+
+    # 6) Median-fill any lag features that are still missing (rookies, new signings)
+    #    Use medians computed from *backtest* rows so distribution is realistic.
+    bt_full = feat_2024[feature_names].copy()
+    med = bt_full.median(numeric_only=True)
+    for col in feature_names:
+        if col not in wk1.columns:
+            wk1[col] = med.get(col, 0.0)
+    wk1[feature_names] = wk1[feature_names].fillna(med)
+
+    # 7) Now prepare features and predict as usual
+    wk1_feats = apply_encoders(wk1, encoders)
+    X_up = prepare_X(wk1_feats, feature_names)
+    
+    print("Generating 2025 Wk1 predictions...")
+    preds_up = {}
+    shap_up_dict = {}
+    for name, model in models.items():
+        p = model.predict(X_up)
+        preds_up[name] = p
+
+        # SHAP: only for LightGBM (fast). Others = None to skip heavy compute.
+        if name in SHAP_MODELS:
+            b, v = shap_for_lightgbm(model, X_up)
+        else:
+            b, v = (None, None)
+        shap_up_dict[name] = (b, v)
+
+    if preds_up:
+        ens_up = np.mean(np.vstack([v for v in preds_up.values()]), axis=0)
+        preds_up["ensemble"] = ens_up
+        base_up_e, vals_up_e = ensemble_shap(shap_up_dict)
+    else:
+        ens_up = np.array([])
+        base_up_e, vals_up_e = (None, None)
+
+    up_out = wk1[[
+        "player_id","player_name","recent_team","position","season","week"
+    ]].copy()
+    for name, v in preds_up.items():
+        up_out[f"predicted_points_{name}"] = v
+    up_out["dk_salary"] = wk1["dk_salary"].fillna(0).astype(float)
+    up_out["value"] = np.where(up_out["dk_salary"]>0, preds_up["ensemble"]/(up_out["dk_salary"]/1000.0), np.nan)
+    up_out["actual_points"] = np.nan
+    up_out["shap_rationale"] = top_rationales(X_up, feature_names, base_up_e, vals_up_e, k=3)
+    
+    # Add historical features for Dashboard.py enrichment
+    # Targets (last 3 and 5 weeks)
+    up_out["targets_l3"] = wk1.get("targets_avg_last_3", 0.0).fillna(0.0)
+    up_out["targets_l5"] = wk1.get("targets_avg_last_5", 0.0).fillna(0.0)
+    
+    # Routes (last 3 and 5 weeks) - use targets as proxy if routes not available
+    up_out["routes_l3"] = wk1.get("targets_avg_last_3", 0.0).fillna(0.0)  # Proxy for routes
+    up_out["routes_l5"] = wk1.get("targets_avg_last_5", 0.0).fillna(0.0)  # Proxy for routes
+    
+    # Rush attempts (last 3 and 5 weeks)
+    up_out["rush_att_l3"] = wk1.get("carries_avg_last_3", 0.0).fillna(0.0)
+    up_out["rush_att_l5"] = wk1.get("carries_avg_last_5", 0.0).fillna(0.0)
+    
+    # Snaps (last 3 and 5 weeks) - use touches as proxy if snaps not available
+    up_out["snaps_l3"] = wk1.get("touches_avg_last_3", 0.0).fillna(0.0)  # Proxy for snaps
+    up_out["snaps_l5"] = wk1.get("touches_avg_last_5", 0.0).fillna(0.0)  # Proxy for snaps
+    
+    # Target share (last 3 weeks) - use touches as proxy
+    up_out["target_share_l3"] = wk1.get("touches_avg_last_3", 0.0).fillna(0.0)  # Proxy for target share
+    up_out["route_share_l3"] = wk1.get("touches_avg_last_3", 0.0).fillna(0.0)  # Proxy for route share
+    
+    # Red zone data (2024 season totals)
+    up_out["rz_tgts_2024"] = wk1.get("targets_avg_last_10", 0.0).fillna(0.0) * 10  # Estimate from 10-week avg
+    up_out["rz_rush_2024"] = wk1.get("carries_avg_last_10", 0.0).fillna(0.0) * 10  # Estimate from 10-week avg
+
+    # ---------------- Combine & Save ----------------
+    out = pd.concat([backtest_out, up_out], ignore_index=True)
+    use_key = "predicted_points_ensemble" if "predicted_points_ensemble" in out.columns else list(preds_bt.keys())[0]
+    out = out.sort_values(["season","week", use_key], ascending=[True, True, False])
+
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(output_csv, index=False)
+    print(f"✅ Saved {len(out)} rows to {output_csv}")
+
+    # quick summary
+    print("\n=== SUMMARY ===")
+    # backtest metrics if available
+    try:
+        sub = backtest_out.dropna(subset=["actual_points"])
+        y = sub["actual_points"].astype(float)
+        yhat = sub["predicted_points_ensemble"].astype(float)
+        mae = (y - yhat).abs().mean()
+        rmse = np.sqrt(((y - yhat)**2).mean())
+        corr = y.corr(yhat)
+        print(f"Backtest (2024 w13–17): rows={len(sub)}, MAE={mae:.2f}, RMSE={rmse:.2f}, Corr={corr:.3f}")
+    except Exception:
+        print("Backtest metrics unavailable (missing ensemble or actuals).")
+
+    wk1 = out[(out["season"]==upcoming_season) & (out["week"]==upcoming_week)]
+    if "value" in wk1.columns:
+        print(f"2025 Wk1 rows: {len(wk1)}, top value example:")
+        print(wk1[["player_name","recent_team","dk_salary","value","predicted_points_ensemble"]].head(10).to_string(index=False))
+
+    return out
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="RB Inference (QB/WR-style)")
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--master-sheet", default=DEFAULT_MASTER_SHEET)
+    parser.add_argument("--crosswalk", default=DEFAULT_CROSSWALK)
+    parser.add_argument("--aliases", default=DEFAULT_ALIASES)
+    parser.add_argument("--upcoming-season", type=int, default=2025)
+    parser.add_argument("--upcoming-week", type=int, default=1)
+    parser.add_argument("--output", default="rb_predictions.csv")
+    args = parser.parse_args()
+
+    run_inference(
+        model_dir=args.model_dir,
+        master_sheet_path=args.master_sheet,
+        crosswalk_path=args.crosswalk,
+        aliases_path=args.aliases,
+        upcoming_season=args.upcoming_season,
+        upcoming_week=args.upcoming_week,
+        output_csv=args.output
+    )
 
 if __name__ == "__main__":
     main()

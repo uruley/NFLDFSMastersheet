@@ -1,379 +1,531 @@
 #!/usr/bin/env python3
 """
-Fixed QB Model Inference Script
-Addresses issues with unrealistic predictions and transformation errors
+QB Model Inference Script (WR-style, no leakage)
+- Past 5 weeks of 2024 (with actuals + predictions)
+- 2025 Week 1 projections from 2024 lag stats (no placeholder stats)
+- Joins DraftKings salaries + computes value
+- SHAP explanations for ensemble
 """
+
 import os
+os.environ["JOBLIB_MULTIPROCESSING"] = "0"
+os.environ["LOKY_MAX_CPU_COUNT"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import pandas as pd
 import numpy as np
-import pickle
-import json
+import pickle, json, warnings
+import re
 from pathlib import Path
 import nfl_data_py as nfl
+import catboost as cb
+import shap
 
-def clean_name(name):
-    if pd.isna(name): return ''
-    name = str(name).replace(' Jr.', '').replace(' Sr.', '').replace(' III', '').replace(' II', '').replace(' IV', '')
-    return ''.join(c for c in name if c.isalnum() or c.isspace()).strip().lower()
+warnings.filterwarnings("ignore")
 
-def norm_team(team):
-    if pd.isna(team): return ''
-    return str(team).strip().upper()
+# ---------------------------
+# Helper Functions
+# ---------------------------
 
-def norm_pos(position):
-    if pd.isna(position): return ''
-    return str(position).strip().upper()
+def _norm_name(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.lower().strip()
+    # remove punctuation & common suffixes
+    s = re.sub(r"[.\'\-]", "", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-def load_advanced_models(model_dir):
-    """Load all trained models and artifacts."""
-    print(f"Loading advanced QB models from {model_dir}")
-    
-    models = {}
-    model_files = {
-        'lightgbm': 'lightgbm_model.pkl',
-        'catboost': 'catboost_model.pkl',
-        'random_forest': 'random_forest_model.pkl',
-        'gradient_boosting': 'gradient_boosting_model.pkl'
-    }
-    
-    for name, filename in model_files.items():
-        model_path = os.path.join(model_dir, filename)
-        if os.path.exists(model_path):
-            with open(model_path, 'rb') as f:
-                models[name] = pickle.load(f)
-            print(f"Loaded {name} model")
-    
-    encoders_path = os.path.join(model_dir, 'encoders.pkl')
-    with open(encoders_path, 'rb') as f:
-        encoders = pickle.load(f)
-    
-    feature_path = os.path.join(model_dir, 'feature_info.json')
-    with open(feature_path, 'r') as f:
-        feature_info = json.load(f)
-    
-    metrics_path = os.path.join(model_dir, 'model_metrics.json')
-    with open(metrics_path, 'r') as f:
-        metrics = json.load(f)
-    
-    return models, encoders, feature_info, metrics
-
-def load_dk_slate(slate_path):
-    """Load the DraftKings slate."""
-    print(f"Loading DraftKings slate from {slate_path}")
-    
-    dk_slate = pd.read_csv(slate_path)
-    qb_slate = dk_slate[dk_slate['Position'] == 'QB'].copy()
-    
-    print(f"Found {len(qb_slate)} QBs in the slate")
-    
-    qb_slate['clean_name'] = qb_slate['Name'].apply(clean_name)
-    qb_slate['norm_team'] = qb_slate['TeamAbbrev'].apply(norm_team)
-    qb_slate['norm_pos'] = qb_slate['Position'].apply(norm_pos)
-    qb_slate['join_key'] = qb_slate['clean_name'] + "|" + qb_slate['norm_team'] + "|" + qb_slate['norm_pos']
-    
-    return qb_slate
-
-def load_master_sheet(master_sheet_path):
-    """Load the master sheet for player matching."""
-    print(f"Loading master sheet from {master_sheet_path}")
-    
-    if master_sheet_path.endswith('.csv'):
-        master_sheet = pd.read_csv(master_sheet_path)
-    elif master_sheet_path.endswith('.parquet'):
-        master_sheet = pd.read_parquet(master_sheet_path)
-    else:
-        raise ValueError("Master sheet must be CSV or Parquet")
-    
-    return master_sheet
-
-def match_qbs_to_master_sheet(qb_slate, master_sheet):
-    """Match QBs from DK slate to master sheet."""
-    matched_qbs = qb_slate.merge(
-        master_sheet,
-        on='join_key',
-        how='left',
-        suffixes=('_dk', '_master')
-    )
-    
-    matched_count = matched_qbs['player_id'].notna().sum()
-    unmatched_count = len(matched_qbs) - matched_count
-    
-    print(f"Matched: {matched_count} QBs")
-    print(f"Unmatched: {unmatched_count} QBs")
-    
-    return matched_qbs
-
-def get_qb_features_from_master(master_row, current_season=2025, current_week=1):
-    """Get QB features with proper adjustments to avoid unrealistic predictions."""
-    print(f"Getting features for {master_row['Name_dk']} (ID: {master_row['player_id']})")
-    
+def _safe_read_csv(p):
     try:
-        # Get recent QB data
-        if pd.notna(master_row['player_id']):
-            weekly_data = nfl.import_weekly_data([2023, 2024])
-            qb_data = weekly_data[
-                (weekly_data['position'] == 'QB') & 
-                (weekly_data['player_id'] == master_row['player_id'])
-            ].copy()
-        else:
-            weekly_data = nfl.import_weekly_data([2023, 2024])
-            qb_data = weekly_data[
-                (weekly_data['position'] == 'QB') & 
-                (weekly_data['recent_team'] == master_row['norm_team'])
-            ].copy()
-        
-        if len(qb_data) == 0:
-            print(f"No historical data found for {master_row['Name_dk']}")
-            return None
-        
-        qb_data = qb_data.sort_values(['season', 'week'])
-        
-        # Create lagged features (mimicking training)
-        lag_features = [
-            'completions', 'attempts', 'passing_yards', 'passing_tds', 'interceptions',
-            'sacks', 'rushing_attempts', 'rushing_yards', 'rushing_tds',
-            'target_share', 'air_yards_share', 'fantasy_points'
-        ]
-        
-        features = {}
-        for window in [3, 5, 10]:
-            for feature in lag_features:
-                if feature in qb_data.columns:
-                    col_name = f'{feature}_avg_last_{window}'
-                    features[col_name] = qb_data[feature].shift(1).rolling(window=window, min_periods=1).mean().iloc[-1] or 0
-        
-        features['fantasy_points_std_last_5'] = qb_data['fantasy_points'].shift(1).rolling(window=5, min_periods=2).std().iloc[-1] or 5.0
-        
-        # Derived features
-        features['completion_rate_last_3'] = (
-            features.get('completions_avg_last_3', 0) / (features.get('attempts_avg_last_3', 1) or 1)
-        ) * 0.95
-        features['completion_rate_last_3'] = min(features['completion_rate_last_3'], 0.75)
-        
-        features['yards_per_attempt_last_3'] = (
-            features.get('passing_yards_avg_last_3', 0) / (features.get('attempts_avg_last_3', 1) or 1)
-        ) * 0.9
-        features['yards_per_attempt_last_3'] = min(features['yards_per_attempt_last_3'], 9.0)
-        
-        features['td_rate_last_3'] = (
-            features.get('passing_tds_avg_last_3', 0) / (features.get('attempts_avg_last_3', 1) or 1)
-        ) * 0.85
-        features['td_rate_last_3'] = min(features['td_rate_last_3'], 0.10)
-        
-        features['int_rate_last_3'] = (
-            features.get('interceptions_avg_last_3', 0) / (features.get('attempts_avg_last_3', 1) or 1)
-        )
-        features['int_rate_last_3'] = min(features['int_rate_last_3'], 0.08)
-        
-        # Context features
-        features['week'] = current_week
-        features['early_season'] = 1 if current_week <= 4 else 0
-        features['mid_season'] = 1 if 4 < current_week <= 12 else 0
-        features['late_season'] = 1 if current_week > 12 else 0
-        features['week_progression'] = current_week / 18
-        features['is_consistent'] = 1 if features['fantasy_points_std_last_5'] < 8 else 0
-        features['recent_team'] = master_row['norm_team_dk']
-        
-        # Cap total stats
-        features['total_yards'] = min(
-            (features.get('passing_yards_avg_last_3', 0) * 0.9 + 
-             features.get('rushing_yards_avg_last_3', 0) * 0.8),
-            400
-        )
-        features['total_tds'] = min(
-            (features.get('passing_tds_avg_last_3', 0) * 0.85 + 
-             features.get('rushing_tds_avg_last_3', 0) * 0.7),
-            4
-        )
-        
-        print(f"Found {len(qb_data)} historical performances")
-        return features
-    
-    except Exception as e:
-        print(f"Error getting features for {master_row['Name_dk']}: {e}")
+        return pd.read_csv(p)
+    except Exception:
         return None
 
-def encode_qb_features(qb_features, encoders, feature_names):
-    """Encode QB features for model prediction."""
-    feature_vector = []
-    
-    for feature in feature_names:
-        if feature in qb_features:
-            value = qb_features[feature]
-            if 'yards' in feature.lower():
-                value = min(value, 500)
-            elif 'tds' in feature.lower() or 'touchdowns' in feature.lower():
-                value = min(value, 5)
-            elif 'rate' in feature.lower() or 'percentage' in feature.lower():
-                value = min(value, 1.0)
-            feature_vector.append(value)
-        elif feature == 'team_encoded':
-            team = qb_features.get('recent_team', 'UNK')
-            if team in encoders['team'].classes_:
-                feature_vector.append(encoders['team'].transform([team])[0])
-            else:
-                feature_vector.append(0)
-        elif feature == 'opponent_encoded':
-            feature_vector.append(0)
-        elif feature == 'season_type_encoded':
-            feature_vector.append(0)
-        else:
-            feature_vector.append(0)
-    
-    return np.array(feature_vector).reshape(1, -1)
+class QBInferenceEngine:
+    def __init__(self, model_dir="QB_Model"):
+        self.model_dir = Path(model_dir)
+        self.models = {}
+        self.encoders = {}
+        self.scaler = None
+        self.feature_names = []
+        self._load_models()
+        self._load_encoders()
+        self._load_scaler()
+        self._load_schema()
 
-def make_ensemble_predictions(matched_qbs, models, encoders, feature_names, metrics, current_season=2025, current_week=1):
-    """Make predictions with realistic adjustments and proper transformation."""
-    print("Making ensemble QB predictions with adjustments...")
-    
-    predictions = []
-    weights = np.array([1.0 / (metrics[model]['rmse'] + 0.001) for model in models])
-    weights = weights / weights.sum()  # Normalize weights
-    
-    for _, qb_row in matched_qbs.iterrows():
-        qb_name = qb_row['Name_dk']
-        team = qb_row['TeamAbbrev_dk']
-        salary = qb_row['Salary_dk']
-        player_id = qb_row.get('player_id', 'Unknown')
-        
-        print(f"\nProcessing {qb_name} ({team}) - Salary: ${salary:,}")
-        
-        qb_features = get_qb_features_from_master(qb_row, current_season, current_week)
-        
-        if qb_features is None:
-            print(f"No features for {qb_name} - using salary-based default")
-            # Salary-based default prediction
-            default_points = min(18.0, max(8.0, 8.0 + (salary - 4000) / 500))
-            ensemble_prediction = default_points
-            prediction_std = 5.0
-            model_predictions = {name: default_points for name in models}
-        else:
-            feature_vector = encode_qb_features(qb_features, encoders, feature_names)
-            
-            model_predictions = {}
-            for name, model in models.items():
-                try:
-                    pred_log = model.predict(feature_vector)[0]
-                    pred = np.expm1(pred_log)  # Transform back to original scale
-                    pred = max(0, min(pred, 35))  # Cap between 0 and 35
-                    model_predictions[name] = pred
-                    print(f"  {name}: {pred:.2f} points")
-                except Exception as e:
-                    print(f"  {name}: Error - {e}")
-                    model_predictions[name] = 12.0
-            
-            valid_predictions = [p for p in model_predictions.values() if p > 0]
-            if valid_predictions:
-                if len(valid_predictions) >= 4:
-                    valid_predictions.remove(max(valid_predictions))
-                    valid_predictions.remove(min(valid_predictions))
-                
-                ensemble_prediction = np.average(valid_predictions, weights=weights[:len(valid_predictions)])
-                prediction_std = np.std(valid_predictions)
-                
-                ensemble_prediction = min(ensemble_prediction, 32)
-                
-                # Salary-based adjustment
-                if salary > 7500:
-                    ensemble_prediction *= 0.95
-                elif salary < 5500:
-                    ensemble_prediction *= 1.05
+    # ---------- loads ----------
+    def _load_models(self):
+        files = {
+            "lightgbm": "lightgbm_model.pkl",
+            "catboost": "catboost_model.pkl",
+            "random_forest": "random_forest_model.pkl",
+            "gradient_boosting": "gradient_boosting_model.pkl",
+        }
+        for name, f in files.items():
+            path = self.model_dir / f
+            if path.exists():
+                with open(path, "rb") as fh:
+                    self.models[name] = pickle.load(fh)
+                print(f"✅ Loaded {name}")
             else:
-                ensemble_prediction = 12.0
-                prediction_std = 5.0
+                print(f"⚠️ Missing {f}")
         
-        value = (ensemble_prediction / (salary / 1000)) if salary > 0 else 0
-        
-        predictions.append({
-            'Name': qb_name,
-            'Team': team,
-            'Position': 'QB',
-            'Salary': salary,
-            'Player_ID': player_id,
-            'Ensemble_Prediction': round(ensemble_prediction, 2),
-            'Prediction_Std': round(prediction_std, 2),
-            'Value': round(value, 3),
-            'Recent_Median_Points': round(qb_features.get('fantasy_points_avg_last_3', 0), 2) if qb_features else 0,
-            'Match_Status': 'Matched' if pd.notna(player_id) else 'Unmatched',
-            'LightGBM': round(model_predictions.get('lightgbm', 12), 2),
-            'CatBoost': round(model_predictions.get('catboost', 12), 2),
-            'RandomForest': round(model_predictions.get('random_forest', 12), 2),
-            'GradientBoosting': round(model_predictions.get('gradient_boosting', 12), 2)
-        })
-        
-        print(f"  Adjusted Ensemble: {ensemble_prediction:.2f} ± {prediction_std:.2f} points")
-        print(f"  Value: {value:.3f} pts/$1000")
-    
-    return pd.DataFrame(predictions)
+        # Force single-thread for Windows stability
+        def _force_single_thread(m):
+            name = m.__class__.__name__.lower()
+            # scikit-learn & LGBM wrappers accept n_jobs
+            try: m.set_params(n_jobs=1)
+            except: pass
+            # LightGBM accepts num_threads (in addition to n_jobs)
+            if "lgbm" in name or "lightgbm" in str(type(m)).lower():
+                try: m.set_params(num_threads=1)
+                except: pass
+            # CatBoost uses thread_count
+            if "catboost" in name:
+                try: m.set_params(thread_count=1)
+                except: pass
+            return m
 
-def main():
-    """Main inference function."""
-    model_dir = "QB_Model_Fixed"
-    dk_slate_path = "../../data/raw/DKSalaries.csv"
-    master_sheet_path = "../../data/processed/master_sheet_2025.csv"
-    current_season = 2025
-    current_week = 1
+        for k in list(self.models.keys()):
+            self.models[k] = _force_single_thread(self.models[k])
+
+    def _load_encoders(self):
+        p = self.model_dir / "encoders.pkl"
+        if p.exists():
+            with open(p, "rb") as f:
+                self.encoders = pickle.load(f)
+            print("✅ Loaded encoders")
+        else:
+            self.encoders = {}
+
+    def _load_scaler(self):
+        p = self.model_dir / "scaler.pkl"
+        if p.exists():
+            with open(p, "rb") as f:
+                self.scaler = pickle.load(f)
+            print("✅ Loaded scaler")
+        else:
+            self.scaler = None
+
+    def _load_schema(self):
+        p = self.model_dir / "feature_schema.json"
+        with open(p, "r") as f:
+            schema = json.load(f)
+        self.feature_names = schema["columns"]
+        print(f"✅ Loaded schema with {len(self.feature_names)} features")
+
+    # ---------- feature builders (match training) ----------
+    def create_lagged_features(self, df):
+        df = df.sort_values(["player_id", "season", "week"])
+        lag_features = [
+            "completions","attempts","passing_yards","passing_tds","interceptions",
+            "sacks","carries","rushing_yards","rushing_tds","target_share","air_yards_share"
+        ]
+        for w in [3,5,10]:
+            for feat in lag_features:
+                if feat in df.columns:
+                    df[f"{feat}_avg_last_{w}"] = df.groupby("player_id")[feat].transform(
+                        lambda x: x.shift(1).rolling(window=w, min_periods=1).mean()
+                    )
+        df["fantasy_points_avg_last_3"] = df.groupby("player_id")["fantasy_points_ppr"].transform(
+            lambda x: x.shift(1).rolling(window=3, min_periods=1).mean()
+        )
+        df["fantasy_points_avg_last_10"] = df.groupby("player_id")["fantasy_points_ppr"].transform(
+            lambda x: x.shift(1).rolling(window=10, min_periods=1).mean()
+        )
+        df["fantasy_points_std_last_5"] = df.groupby("player_id")["fantasy_points_ppr"].transform(
+            lambda x: x.shift(1).rolling(window=5, min_periods=2).std()
+        )
+        return df
+
+    def create_derived_features(self, df):
+        df["completion_rate_last_3"] = (df["completions_avg_last_3"] / df["attempts_avg_last_3"]).fillna(0.6).clip(0,0.85)
+        df["yards_per_attempt_last_3"] = (df["passing_yards_avg_last_3"] / df["attempts_avg_last_3"]).fillna(7.0).clip(0,12)
+        df["td_rate_last_3"] = (df["passing_tds_avg_last_3"] / df["attempts_avg_last_3"]).fillna(0.04).clip(0,0.12)
+        df["int_rate_last_3"] = (df["interceptions_avg_last_3"] / df["attempts_avg_last_3"]).fillna(0.02).clip(0,0.1)
+        df["yards_per_rush_last_3"] = (df["rushing_yards_avg_last_3"] / df["carries_avg_last_3"]).fillna(4.0).clip(0,10)
+
+        df["early_season"] = (df["week"] <= 4).astype(int)
+        df["mid_season"] = ((df["week"] > 4) & (df["week"] <= 12)).astype(int)
+        df["late_season"] = (df["week"] > 12).astype(int)
+        df["week_progression"] = df["week"] / 18
+        df["is_consistent"] = (df["fantasy_points_std_last_5"] < 8).astype(int)
+        return df
     
-    print("=== FIXED QB MODEL INFERENCE ===")
-    print(f"Model directory: {model_dir}")
-    print(f"DK slate: {dk_slate_path}")
-    print(f"Master sheet: {master_sheet_path}")
-    print(f"Current season: {current_season}, Week: {current_week}")
-    print()
-    
-    try:
-        models, encoders, feature_info, metrics = load_advanced_models(model_dir)
+    def add_defense_allowed_features(self, weekly_all):
+        qb = weekly_all[weekly_all["position"] == "QB"][["season","week","opponent_team","fantasy_points_ppr"]].copy()
+        qb.rename(columns={"opponent_team":"def_team","fantasy_points_ppr":"qb_fp_allowed"}, inplace=True)
+        qb = qb.sort_values(["def_team","season","week"])
+        for w in (5, 10):
+            qb[f"def_qb_fp_allowed_last_{w}"] = (
+                qb.groupby("def_team")["qb_fp_allowed"]
+                  .transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
+            )
+        qb = qb.drop(columns=["qb_fp_allowed"])
+        return qb
+
+    def encode_categoricals(self, df):
+        # team
+        if "team" in self.encoders:
+            enc = self.encoders["team"]
+            df["team_encoded"] = df["recent_team"].map(
+                lambda x: enc.transform([x])[0] if x in enc.classes_ else enc.transform(["UNK"])[0]
+            )
+        else:
+            df["team_encoded"] = 0
+        # opponent
+        if "opponent" in self.encoders:
+            enc = self.encoders["opponent"]
+            df["opponent_encoded"] = df["opponent_team"].map(
+                lambda x: enc.transform([x])[0] if x in enc.classes_ else enc.transform(["UNK"])[0]
+            )
+        else:
+            df["opponent_encoded"] = 0
+        # season_type
+        if "season_type" in self.encoders:
+            enc = self.encoders["season_type"]
+            df["season_type_encoded"] = df["season_type"].fillna("REG").map(
+                lambda x: enc.transform([x])[0] if x in enc.classes_ else enc.transform(["REG"])[0]
+            )
+        else:
+            df["season_type_encoded"] = 0
+
+        return df
+
+    def prepare_features(self, df):
+        # ensure all columns exist
+        for col in self.feature_names:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        if self.scaler is not None and hasattr(self.scaler, "mean_"):
+            # fill with the same means the scaler saw at training time
+            fill_map = dict(zip(self.feature_names, self.scaler.mean_))
+            X_df = df[self.feature_names].copy().fillna(fill_map)
+            X = self.scaler.transform(X_df.values)
+        else:
+            X_df = df[self.feature_names].copy().fillna(0)
+            X = X_df.values
+
+        return X, df
+
+    # ---------- SHAP ----------
+    def shap_for_lightgbm(self, model, X):
+        sv = model.predict(X, pred_contrib=True)
+        return sv[:, -1], sv[:, :-1]
+
+    def shap_for_catboost(self, model, X):
+        pool = cb.Pool(X)
+        sv = model.get_feature_importance(type="ShapValues", data=pool)
+        return sv[:, -1], sv[:, :-1]
+
+    def shap_for_sklearn_tree(self, model, X):
+        explainer = shap.TreeExplainer(model)
+        vals = explainer.shap_values(X)
+        if isinstance(vals, list):
+            vals = vals[0]
+        base = np.full(X.shape[0], explainer.expected_value)
+        return base, vals
+
+    def ensemble_shap(self, shap_dict):
+        bases = [b for b, v in shap_dict.values()]
+        vals  = [v for b, v in shap_dict.values()]
+        base_e = np.mean(np.vstack(bases), axis=0)
+        vals_e = np.mean(np.stack(vals, axis=0), axis=0)
+        return base_e, vals_e
+
+    def top_rationale_rows(self, X, feature_names, base, shap_vals, k=3, decimals=2):
+        out = []
+        n, d = shap_vals.shape
+        for i in range(n):
+            contrib = shap_vals[i]
+            order = np.argsort(-np.abs(contrib))
+            tops = []
+            for j in order[:k]:
+                sign = "↑" if contrib[j] > 0 else "↓"
+                tops.append(f"{feature_names[j]} {sign} {abs(contrib[j]):.{decimals}f}")
+            pred = base[i] + contrib.sum()
+            out.append(f"~{pred:.1f} pts (base {base[i]:.1f}) • " + ", ".join(tops))
+        return out
+
+    # ---------- Main ----------
+    def run_inference(
+        self,
+        seasons=[2024],
+        past_weeks=[13,14,15,16,17],
+        upcoming_season=2025,
+        upcoming_week=1,
+        master_sheet_path=None,
+        output_file="outputs/projections/qb_predictions.csv"
+    ):
+        print("=== QB Model Inference ===")
+
+        # 1) load historical seasons (e.g., 2024) and build lag features
+        hist = nfl.import_weekly_data(seasons)
+        hist = hist[hist["position"] == "QB"].copy()
+        hist = hist[hist["attempts"] >= 10]
+        hist = self.create_lagged_features(hist)
+        hist = self.create_derived_features(hist)
         
-        if not models:
-            print("No models loaded! Please train the models first.")
-            return
+        # Add defense-vs-QB allowed features
+        def_feats = self.add_defense_allowed_features(hist)
+        hist = hist.merge(def_feats, left_on=["season","week","opponent_team"], right_on=["season","week","def_team"], how="left")
+        hist.drop(columns=["def_team"], inplace=True)
+
+        # 2) past weeks slice (with actuals)
+        past = hist[hist["week"].isin(past_weeks)].copy()
+        past["actual_points"] = past["fantasy_points_ppr"]
+
+        # ===== UPCOMING FROM DK (robust, uses master_sheet_2025 with player_id) =====
+        upcoming = pd.DataFrame()
+        if master_sheet_path:
+            dk = pd.read_csv(master_sheet_path)
+
+            # 1) DK QB slice with salary + id
+            dk_qb = dk[dk["Position"] == "QB"].copy()
+            # normalize column casing
+            for c in ["Name","TeamAbbrev","Salary","player_id","join_key","name_team_key"]:
+                if c not in dk_qb.columns:
+                    dk_qb[c] = np.nan
+
+            dk_qb["dk_name"]   = dk_qb["Name"].astype(str)
+            dk_qb["dk_team"]   = dk_qb["TeamAbbrev"].astype(str)
+            dk_qb["dk_salary"] = pd.to_numeric(dk_qb["Salary"], errors="coerce")
+            dk_qb["player_id"] = dk_qb["player_id"].astype(str)
+
+            # Helper to normalize names for fallback
+            def _norm_name(s: str) -> str:
+                if not isinstance(s, str): return ""
+                s = s.lower().strip()
+                s = re.sub(r"[.\'\-]", "", s)
+                s = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", s)
+                s = re.sub(r"\s+", " ", s)
+                return s.strip()
+
+            # 2) Build latest 2024 features per player_id from hist
+            latest = (
+                hist.sort_values(["player_id","season","week"])
+                    .groupby("player_id")
+                    .tail(1)
+                    .copy()
+            )
+
+            # Fallback join_key on the hist side (name|team|QB) for rows missing id
+            latest["name_norm"] = latest["player_name"].astype(str).map(_norm_name)
+            latest["join_key_fb"] = latest["name_norm"] + "|" + latest["recent_team"].astype(str) + "|QB"
+
+            # 3) Primary join: DK -> latest by player_id
+            has_id_mask = dk_qb["player_id"].notna() & (dk_qb["player_id"].str.len() > 0)
+            dk_with_feats = dk_qb.merge(
+                latest, on="player_id", how="left", suffixes=("_dk","_hist")
+            )
+
+            # 4) Fallback for rows without player_id or where id didn't hit a 2024 row (rookies/new QBs)
+            need_fb = dk_with_feats["player_name"].isna()
+            if need_fb.any():
+                # build join_key on DK side
+                dk_with_feats.loc[:, "name_norm"] = dk_with_feats["dk_name"].astype(str).map(_norm_name)
+                dk_with_feats.loc[:, "join_key_fb"] = dk_with_feats["name_norm"] + "|" + dk_with_feats["dk_team"] + "|QB"
+
+                fb_map = latest[["join_key_fb","player_id","player_name","recent_team"]].drop_duplicates()
+                fb_join = dk_with_feats.loc[need_fb, ["join_key_fb"]].merge(
+                    fb_map, on="join_key_fb", how="left"
+                )
+
+                # fill from fallback where available
+                for col in ["player_id","player_name","recent_team"]:
+                    dk_with_feats.loc[need_fb, col] = dk_with_feats.loc[need_fb, col].fillna(pd.Series(fb_join[col].values, index=dk_with_feats.loc[need_fb].index))
+
+            # 5) Stamp upcoming fields
+            dk_with_feats["season"] = upcoming_season
+            dk_with_feats["week"] = upcoming_week
+            dk_with_feats["season_type"] = "REG"
+            dk_with_feats["position"] = "QB"
+            dk_with_feats["actual_points"] = np.nan
+            dk_with_feats["dk_salary"] = dk_with_feats["dk_salary"].fillna(0).astype(float)
+
+            # Prefer hist player_name when available; otherwise fall back to DK name
+            if "player_name" in dk_with_feats.columns:
+                dk_with_feats["player_name"] = dk_with_feats["player_name"].fillna(dk_with_feats["dk_name"])
+            else:
+                dk_with_feats["player_name"] = dk_with_feats["dk_name"]
+
+            # 6) Keep just one name column and clean up
+            upcoming = dk_with_feats
+            # optional: drop helper cols
+            drop_helpers = ["name_norm","join_key_fb"]
+            for c in drop_helpers:
+                if c in upcoming.columns:
+                    upcoming.drop(columns=c, inplace=True)
+
+            # 7) Logging
+            matched_cnt = int(upcoming["player_name"].notna().sum())
+            total_cnt = int(len(upcoming))
+            print(f"DK→2024 link (by player_id, with fallback): {matched_cnt}/{total_cnt} rows have features")
+            
+            # Add defense features to upcoming data (only where opponent_team is known)
+            if len(upcoming) > 0:
+                upcoming_def_feats = self.add_defense_allowed_features(hist)
+                has_opp = upcoming["opponent_team"].notna()
+                if has_opp.any():
+                    upcoming.loc[has_opp, :] = upcoming.loc[has_opp, :].merge(
+                        upcoming_def_feats,
+                        left_on=["season","week","opponent_team"],
+                        right_on=["season","week","def_team"],
+                        how="left"
+                    )
+                    if "def_team" in upcoming.columns:
+                        upcoming.drop(columns=["def_team"], inplace=True)
+                # fill unknown opponents with league-average per season
+                for col in ["def_qb_fp_allowed_last_5","def_qb_fp_allowed_last_10"]:
+                    if col not in upcoming.columns:
+                        upcoming[col] = np.nan
+                    season_means = hist.groupby("season")[col.replace("def_","")].mean() if col.replace("def_","") in hist.columns else hist.groupby("season")["fantasy_points_ppr"].mean()
+                    upcoming[col] = upcoming[col].fillna(upcoming["season"].map(season_means))
+
+        # 4) combine and (re)derive features → encode → prepare matrix
+        data = pd.concat([past, upcoming], ignore_index=True, sort=False)
+        data = self.create_derived_features(data)
+        data = self.encode_categoricals(data)
+        X, data = self.prepare_features(data)
+
+        # 5) predict per model + ensemble
+        preds, shap_dict = {}, {}
+        for name, model in self.models.items():
+            yhat = model.predict(X)
+            preds[name] = np.clip(yhat, 0, 50)
+            if name == "lightgbm":
+                shap_dict[name] = self.shap_for_lightgbm(model, X)
+            elif name == "catboost":
+                shap_dict[name] = self.shap_for_catboost(model, X)
+            else:
+                shap_dict[name] = self.shap_for_sklearn_tree(model, X)
+
+        # Weighted ensemble by holdout R²
+        import json, pathlib, math
         
-        qb_slate = load_dk_slate(dk_slate_path)
-        master_sheet = load_master_sheet(master_sheet_path)
-        matched_qbs = match_qbs_to_master_sheet(qb_slate, master_sheet)
+        metrics_path = pathlib.Path("QB_Model/metrics.json")
+        if metrics_path.exists():
+            m = json.loads(metrics_path.read_text())
+            r2s = {
+                "lightgbm": max(0.0, float(m["lightgbm"]["holdout_r2"])),
+                "catboost": max(0.0, float(m["catboost"]["holdout_r2"])),
+                "random_forest": max(0.0, float(m["random_forest"]["holdout_r2"])),
+                "gradient_boosting": max(0.0, float(m["gradient_boosting"]["holdout_r2"])),
+            }
+        else:
+            r2s = {"lightgbm": 1, "catboost": 1, "random_forest": 1, "gradient_boosting": 1}
         
-        if len(matched_qbs) == 0:
-            print("No QBs found in the slate!")
-            return
+        Z = sum(r2s.values()) or 1.0
+        w = {k: v / Z for k, v in r2s.items()}
         
-        predictions_df = make_ensemble_predictions(
-            matched_qbs, models, encoders, 
-            feature_info['feature_names'], metrics, current_season, current_week
+        # Calculate weighted ensemble
+        data["predicted_points_ensemble"] = (
+            w["lightgbm"]          * preds["lightgbm"] +
+            w["catboost"]          * preds["catboost"] +
+            w["random_forest"]     * preds["random_forest"] +
+            w["gradient_boosting"] * preds["gradient_boosting"]
         )
         
-        if len(predictions_df) == 0:
-            print("No predictions generated!")
-            return
-        
-        predictions_df = predictions_df.sort_values('Ensemble_Prediction', ascending=False)
-        
-        print("\n" + "="*100)
-        print("ADJUSTED QB PREDICTIONS")
-        print("="*100)
-        
-        display_cols = ['Name', 'Team', 'Salary', 'Ensemble_Prediction', 'Prediction_Std', 'Value']
-        print(predictions_df[display_cols].to_string(index=False))
-        
-        output_path = "qb_predictions_fixed.csv"
-        predictions_df.to_csv(output_path, index=False)
-        print(f"\nPredictions saved to: {output_path}")
-        
-        print(f"\n=== SUMMARY ===")
-        print(f"Total QBs: {len(predictions_df)}")
-        print(f"Average prediction: {predictions_df['Ensemble_Prediction'].mean():.2f}")
-        print(f"Range: {predictions_df['Ensemble_Prediction'].min():.2f} - {predictions_df['Ensemble_Prediction'].max():.2f}")
-        print(f"Top QB: {predictions_df.iloc[0]['Name']} - {predictions_df.iloc[0]['Ensemble_Prediction']:.2f} points")
-        
-        unrealistic = predictions_df[predictions_df['Ensemble_Prediction'] > 35]
-        if len(unrealistic) > 0:
-            print(f"\nWARNING: {len(unrealistic)} predictions still above 35 points!")
+        # Add individual model predictions
+        for name, arr in preds.items():
+            data[f"predicted_points_{name}"] = arr
+
+        # 6) SHAP ensemble rationale (before cold-start shrink to maintain row alignment)
+        base_e, vals_e = self.ensemble_shap(shap_dict)
+        data["shap_rationale"] = self.top_rationale_rows(X, self.feature_names, base_e, vals_e)
+
+        # 7) Cold-start shrink at inference
+
+        def _compute_player_means(history_df):
+            # history_df must include: player_id, fantasy_points_ppr, season, week, attempts
+            hist = history_df.sort_values(["player_id","season","week"]).copy()
+            hist["eligible"] = (hist["attempts"] >= 10).astype(int)
+            # last3 mean for each player excluding current row; we'll merge values by last known week
+            hist["fp_last3"] = hist.groupby("player_id")["fantasy_points_ppr"].transform(
+                lambda x: x.shift(1).rolling(3, min_periods=1).mean()
+            )
+            # last10 count of eligible games
+            hist["g_last10"] = hist.groupby("player_id")["eligible"].transform(
+                lambda x: x.shift(1).rolling(10, min_periods=1).sum()
+            )
+            # Keep last row per (player, season, week) for merge keys
+            return hist[["player_id","season","week","fp_last3","g_last10"]]
+
+        # Apply cold-start shrink
+        if len(past) > 0:  # Only if we have historical data
+            # Get historical data for cold-start calculation
+            df_hist = past.copy()
+            global_mean = float(df_hist["fantasy_points_ppr"].clip(lower=0, upper=50).mean())
+            
+            pm = _compute_player_means(df_hist)
+            data = data.merge(pm, on=["player_id","season","week"], how="left")
+            
+            data["fp_last3"].fillna(global_mean, inplace=True)
+            data["g_last10"].fillna(0, inplace=True)
+            
+            prior = 0.6 * data["fp_last3"] + 0.4 * global_mean
+            w = (data["g_last10"] / 4.0).clip(lower=0.0, upper=1.0)
+            
+            data["predicted_points_final"] = (w * data["predicted_points_ensemble"] + (1 - w) * prior).clip(lower=0, upper=50)
+            
+            # Also export predicted_points_final as the value column you feed into downstream tools
+            data.rename(columns={"predicted_points_final":"predicted_points"}, inplace=True)
         else:
-            print("\n✓ All predictions within realistic range (0-35 points)")
+            # If no historical data, use ensemble as final prediction
+            data["predicted_points"] = data["predicted_points_ensemble"]
+
+        # 8) value from DK salary if present
+        if "dk_salary" in data.columns:
+            data["value"] = data["predicted_points"] / (data["dk_salary"] / 1000)
+        else:
+            data["dk_salary"] = 0
+            data["value"] = np.nan
+
+        # 8) output cols
+        cols = [
+            "player_id","player_name","recent_team","position","season","week",
+            "actual_points","dk_salary","value","predicted_points_ensemble","predicted_points",
+            "predicted_points_lightgbm","predicted_points_catboost",
+            "predicted_points_random_forest","predicted_points_gradient_boosting",
+            "shap_rationale"
+        ]
+        # ensure presence
+        for c in cols:
+            if c not in data.columns:
+                data[c] = np.nan
+
+        out = data[cols].copy()
         
-    except Exception as e:
-        print(f"Error during inference: {e}")
-        import traceback
-        traceback.print_exc()
+        # Keep the highest predicted_points per (player_id, season, week)
+        out = (out.sort_values(["player_id","season","week","predicted_points"], ascending=[True,True,True,False])
+               .drop_duplicates(subset=["player_id","season","week"], keep="first")
+               .reset_index(drop=True))
+        
+        # ensure output dir exists, then write
+        out_path = Path(output_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(out_path, index=False)
+        print(f"✅ Saved predictions to {output_file}")
+        return out
+
+
+def main():
+    engine = QBInferenceEngine("QB_Model")
+    out = engine.run_inference(
+        seasons=[2024],
+        past_weeks=[13,14,15,16,17],
+        upcoming_season=2025,
+        upcoming_week=1,
+        master_sheet_path=r"C:\Users\ruley\NFLDFSMasterSheet\data\processed\master_sheet_2025.csv",
+        output_file="outputs/projections/qb_predictions.csv"
+    )
+    if out is not None:
+        print(out.head(15).to_string(index=False))
 
 if __name__ == "__main__":
     main()

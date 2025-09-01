@@ -1,0 +1,6 @@
+Score MAE (2024):
+  Home MAE: 7.684
+  Away MAE: 7.782
+Winners from scores (acc): 0.684
+Brier (raw): 0.290
+Brier (calibrated): 0.291

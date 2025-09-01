@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 import pickle
 import json
+import os
+import re
 from pathlib import Path
 import nfl_data_py as nfl
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -15,6 +17,88 @@ import catboost as cb
 import shap
 import warnings
 warnings.filterwarnings('ignore')
+
+# --- Windows-safe thread env vars + small helpers ---
+# Avoid Windows/joblib stalls when counting cores / spawning
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+TEAM_MAP = {"JAC":"JAX","LA":"LAR","LAR":"LAR","STL":"LAR","OAK":"LVR","LV":"LVR","WSH":"WAS","WAS":"WAS"}
+def map_team(t: str) -> str:
+    s = str(t).upper()
+    return TEAM_MAP.get(s, s)
+
+def norm_name(s: str) -> str:
+    if not isinstance(s, str): return ""
+    s = s.lower().strip()
+    s = re.sub(r"[.\'\-]", "", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+# --- TE lag builder (parallel to RB) ---
+TE_LAG_BASE = [
+    "receptions","targets","receiving_yards","receiving_tds",
+    "carries","rushing_yards","fantasy_points_ppr"
+]
+TE_WINDOWS = (3,5,10)
+
+def add_te_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["player_id","season","week"]).copy()
+    
+    # Create lag features for base columns
+    for col in TE_LAG_BASE:
+        if col not in df.columns:
+            df[col] = 0.0
+        # Create lag column (previous week)
+        df[f"{col}_lag"] = df.groupby("player_id")[col].shift(1).fillna(0)
+        
+        # Create rolling averages
+        for k in TE_WINDOWS:
+            df[f"{col}_avg_last_{k}"] = (
+                df.groupby("player_id")[col].shift(1).rolling(k, min_periods=1).mean()
+            )
+
+    # Create derived features from lag data
+    for k in TE_WINDOWS:
+        rc = df.get(f"receptions_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        tg = df.get(f"targets_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        rcy = df.get(f"receiving_yards_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        ca  = df.get(f"carries_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+        ry  = df.get(f"rushing_yards_avg_last_{k}", pd.Series(0.0, index=df.index)).fillna(0)
+
+        df[f"yards_per_reception_last_{k}"] = np.where(rc > 0, rcy/rc, 0.0)
+        df[f"yards_per_target_last_{k}"]    = np.where(tg > 0, rcy/tg, 0.0)
+        df[f"yards_per_rush_last_{k}"]      = np.where(ca > 0, ry/ca, 0.0)
+
+        touches = rc + ca
+        df[f"touches_avg_last_{k}"] = touches
+        df[f"yards_per_touch_last_{k}"] = np.where(touches > 0, (rcy+ry)/touches, 0.0)
+
+    # Create additional required features
+    df["early_season"] = (df["week"] <= 4).astype(int)
+    df["mid_season"]   = ((df["week"] > 4) & (df["week"] <= 12)).astype(int)
+    df["late_season"]  = (df["week"] > 12).astype(int)
+    df["week_progression"] = df["week"]/18.0
+    
+    # Create missing features that the model expects
+    df["target_share_lag"] = df.get("target_share", 0.0)
+    df["air_yards_share_lag"] = df.get("air_yards_share", 0.0)
+    df["wopr_lag"] = df.get("wopr", 0.0)
+    df["receiving_epa_lag"] = df.get("receiving_epa", 0.0)
+    df["receiving_first_downs_lag"] = df.get("receiving_first_downs", 0.0)
+    df["catch_rate_lag"] = np.where(df.get("targets_lag", 0) > 0, df.get("receptions_lag", 0) / df.get("targets_lag", 1), 0.0)
+    df["yards_per_reception_lag"] = np.where(df.get("receptions_lag", 0) > 0, df.get("receiving_yards_lag", 0) / df.get("receptions_lag", 1), 0.0)
+    df["yards_per_target_lag"] = np.where(df.get("targets_lag", 0) > 0, df.get("receiving_yards_lag", 0) / df.get("targets_lag", 1), 0.0)
+    df["yards_per_rush_lag"] = np.where(df.get("carries_lag", 0) > 0, df.get("rushing_yards_lag", 0) / df.get("carries_lag", 1), 0.0)
+    df["total_yards_lag"] = df.get("receiving_yards_lag", 0) + df.get("rushing_yards_lag", 0)
+    df["total_touches_lag"] = df.get("receptions_lag", 0) + df.get("carries_lag", 0)
+    df["red_zone_targets_share_lag"] = 0.0  # Default value
+    
+    return df
 
 class TEInferenceEngine:
     """Advanced TE inference engine with SHAP explanations and dynamic weighting."""
@@ -128,52 +212,128 @@ class TEInferenceEngine:
         print(f"Records for prediction: {te_data['prediction_week'].sum()}")
         return te_data
 
-    def load_upcoming_data(self, season=2025, week=1):
+    def load_upcoming_data(self, season=2025, week=1, master_sheet_path=None):
         """Load data for upcoming week with 2024 Week 17 lagged features."""
         print(f"Loading upcoming TE data for season {season}, week {week}")
-        print("Loading 2024 Week 17 for lagged features...")
-        lag_data = self.load_historical_data(seasons=[2024], weeks=[17])
         
-        # Build aggregation dict dynamically based on available columns
-        agg_dict = {}
-        for col in ['receptions', 'targets', 'receiving_yards', 'receiving_tds', 
-                    'rushing_yards', 'carries', 'target_share', 'air_yards_share', 
-                    'wopr', 'receiving_epa', 'receiving_first_downs']:
-            if col in lag_data.columns:
-                agg_dict[col] = 'mean'
+        if not master_sheet_path:
+            print("⚠️ No master sheet path provided, using placeholder data")
+            # Fallback to placeholder if no master sheet
+            lag_data = self.load_historical_data(seasons=[2024], weeks=[17])
+            
+            # Build aggregation dict dynamically based on available columns
+            agg_dict = {}
+            for col in ['receptions', 'targets', 'receiving_yards', 'receiving_tds', 
+                        'rushing_yards', 'carries', 'target_share', 'air_yards_share', 
+                        'wopr', 'receiving_epa', 'receiving_first_downs']:
+                if col in lag_data.columns:
+                    agg_dict[col] = 'mean'
+            
+            # Handle red_zone_targets specially
+            if 'red_zone_targets' in lag_data.columns:
+                agg_dict['red_zone_targets'] = 'mean'
+            
+            lag_stats = lag_data.groupby('player_id').agg(agg_dict).reset_index()
+            
+            # Add red_zone_targets column if it wasn't in the data
+            if 'red_zone_targets' not in lag_stats.columns:
+                lag_stats['red_zone_targets'] = 0
+            
+            upcoming_data = pd.DataFrame({
+                'player_id': ['00-0035662', '00-0036973', '00-0038111', '00-0037744', '00-0039338'],
+                'player_name': ['T.Kelce', 'G.Kittle', 'M.Andrews', 'T.McBride', 'B.Bowers'],
+                'recent_team': ['KC', 'SF', 'BAL', 'ARI', 'LV'],
+                'position': ['TE', 'TE', 'TE', 'TE', 'TE'],
+                'season': [season, season, season, season, season],
+                'week': [week, week, week, week, week],
+                'opponent_team': ['BAL', 'NYJ', 'KC', 'LAR', 'LAC'],
+                'season_type': ['REG', 'REG', 'REG', 'REG', 'REG']
+            })
+            
+            upcoming_data = upcoming_data.merge(lag_stats, on='player_id', how='left').fillna(0)
+            
+            # Create lagged features
+            for col in ['receptions', 'targets', 'receiving_yards', 'receiving_tds', 'rushing_yards', 'carries',
+                        'target_share', 'air_yards_share', 'wopr', 'receiving_epa', 'receiving_first_downs', 'red_zone_targets']:
+                if col in upcoming_data.columns:
+                    upcoming_data[f'{col}_lag'] = upcoming_data[col]
+                    upcoming_data = upcoming_data.drop(columns=[col])
+            
+            print(f"Loaded {len(upcoming_data)} upcoming TE records with lagged features (placeholder)")
+            return upcoming_data
         
-        # Handle red_zone_targets specially
-        if 'red_zone_targets' in lag_data.columns:
-            agg_dict['red_zone_targets'] = 'mean'
+        # --- Build 2025 Week 1 from latest 2024 features ---
+        print("Building 2025 Week 1 from latest 2024 features...")
         
-        lag_stats = lag_data.groupby('player_id').agg(agg_dict).reset_index()
+        # 1) Get training feature list
+        if not hasattr(self, 'feature_names') or not self.feature_names:
+            print("⚠️ No feature schema loaded, using placeholder data")
+            return self.load_upcoming_data(season, week, None)  # Fallback to placeholder
         
-        # Add red_zone_targets column if it wasn't in the data
-        if 'red_zone_targets' not in lag_stats.columns:
-            lag_stats['red_zone_targets'] = 0
+        # 2) Build full 2024 feature table (same function used for backtest) 
+        #    and slice the *latest row per player*
+        print("Loading 2024 data and building features...")
+        wb_2024 = nfl.import_weekly_data([2024])
+        te_2024 = wb_2024[wb_2024["position"] == "TE"].copy()
         
-        upcoming_data = pd.DataFrame({
-            'player_id': ['00-0035662', '00-0036973', '00-0038111', '00-0037744', '00-0039338'],
-            'player_name': ['T.Kelce', 'G.Kittle', 'M.Andrews', 'T.McBride', 'B.Bowers'],
-            'recent_team': ['KC', 'SF', 'BAL', 'ARI', 'LV'],
-            'position': ['TE', 'TE', 'TE', 'TE', 'TE'],
-            'season': [season, season, season, season, season],
-            'week': [week, week, week, week, week],  # Fixed typo here
-            'opponent_team': ['BAL', 'NYJ', 'KC', 'LAR', 'LAC'],
-            'season_type': ['REG', 'REG', 'REG', 'REG', 'REG']
-        })
+        # Build features using the same method as training
+        te_2024 = self.create_derived_features(te_2024)
+        te_2024 = self.encode_categorical_features(te_2024)
         
-        upcoming_data = upcoming_data.merge(lag_stats, on='player_id', how='left').fillna(0)
+        # Get latest 2024 row per player
+        latest_2024 = (
+            te_2024.sort_values(["player_id","season","week"])
+                     .groupby("player_id")
+                     .tail(1)
+        )
         
-        # Create lagged features
-        for col in ['receptions', 'targets', 'receiving_yards', 'receiving_tds', 'rushing_yards', 'carries',
-                    'target_share', 'air_yards_share', 'wopr', 'receiving_epa', 'receiving_first_downs', 'red_zone_targets']:
-            if col in upcoming_data.columns:
-                upcoming_data[f'{col}_lag'] = upcoming_data[col]
-                upcoming_data = upcoming_data.drop(columns=[col])
+        # Keep only the columns the model expects (+ id)
+        feature_cols = [c for c in self.feature_names if c in latest_2024.columns]
+        latest_slice = latest_2024[["player_id"] + feature_cols].copy()
         
-        print(f"Loaded {len(upcoming_data)} upcoming TE records with lagged features")
-        return upcoming_data
+        # 3) Read Master Sheet and prefer its player_id
+        print(f"Loading master sheet from {master_sheet_path}")
+        dk = pd.read_csv(master_sheet_path)
+        dk_te = dk[dk["Position"] == "TE"].copy()
+        
+        # If Master Sheet already has player_id, great; otherwise try crosswalk (optional)
+        if "player_id" not in dk_te.columns or dk_te["player_id"].isna().all():
+            try:
+                # optional fallback only if you want it
+                cw = pd.read_csv("../../data/processed/crosswalk_2025.csv")
+                cw["name_norm"] = cw["player_name"].str.lower().str.strip()
+                dk_te["name_norm"] = dk_te["Name"].str.lower().str.strip()
+                dk_te = dk_te.merge(
+                    cw[["player_id","recent_team","name_norm"]],
+                    on=["name_norm"], how="left"
+                )
+            except Exception:
+                pass  # keep going with whatever IDs we have
+        
+        # 4) Merge DK → latest feature slice by player_id
+        wk1 = dk_te.merge(latest_slice, on="player_id", how="left")
+        
+        # 5) Stamp meta fields used downstream
+        wk1["season"] = season
+        wk1["week"] = week
+        wk1["season_type"] = "REG"
+        wk1["position"] = "TE"
+        wk1["recent_team"] = wk1.get("TeamAbbrev", wk1.get("recent_team", "UNK"))
+        wk1["player_name"] = wk1.get("Name", wk1.get("player_name", "Unknown"))
+        wk1["opponent_team"] = np.nan  # Will be filled by encoder with 'UNK'
+        wk1["actual_points"] = np.nan
+        
+        # 6) Median-fill any lag features that are still missing (rookies, new signings)
+        #    Use medians computed from *backtest* rows so distribution is realistic.
+        bt_full = te_2024[feature_cols].copy()
+        med = bt_full.median(numeric_only=True)
+        for col in feature_cols:
+            if col not in wk1.columns:
+                wk1[col] = med.get(col, 0.0)
+        wk1[feature_cols] = wk1[feature_cols].fillna(med)
+        
+        print(f"✅ Built Week 1 data: {len(wk1)} TEs with {len(feature_cols)} features")
+        return wk1
 
     def calculate_actual_points(self, te_data):
         """Calculate actual PPR fantasy points for historical data."""
@@ -302,24 +462,14 @@ class TEInferenceEngine:
         """Prepare features for inference (same as training)."""
         print("Preparing features for inference...")
         
-        # Create lagged features
-        te_data = self.create_lagged_features(te_data)
-        
-        # Create derived features
-        te_data = self.create_derived_features(te_data)
-        
-        # Encode categorical features
-        te_data = self.encode_categorical_features(te_data)
-        
-        # Use feature schema for the final feature set (what models expect)
+        # Ensure all required features exist
         if self.feature_names:
             model_features = self.feature_names
-            print(f"Models expect {len(model_features)} features: {model_features}")
+            print(f"Models expect {len(model_features)} features")
         else:
             print("⚠️ No feature schema found, using all numeric columns")
             model_features = [col for col in te_data.columns if te_data[col].dtype in ['float64', 'float32', 'int64', 'int32']]
         
-        # Ensure all required features exist
         for col in model_features:
             if col not in te_data.columns:
                 print(f"Adding missing feature: {col}")
@@ -327,61 +477,16 @@ class TEInferenceEngine:
         
         # Apply scaling if available
         if self.scaler is not None:
-            # Check what features the scaler expects
-            if hasattr(self.scaler, 'feature_names_in_'):
-                scaler_features = list(self.scaler.feature_names_in_)
-                print(f"Scaler expects {len(scaler_features)} features")
-                
-                # Ensure we have all features the scaler needs
-                for col in scaler_features:
-                    if col not in te_data.columns:
-                        print(f"Adding missing scaler feature: {col}")
-                        te_data[col] = 0
-                
-                # Create matrix with scaler's expected features
-                X_for_scaler = te_data[scaler_features].fillna(0)
-                
-                # Apply scaling
-                X_scaled_full = self.scaler.transform(X_for_scaler)
-                print(f"✅ Applied scaler to {X_scaled_full.shape[1]} features")
-                
-                # Now extract only the features that models expect
-                # Map model features to their indices in the scaler output
-                model_feature_indices = []
-                for feat in model_features:
-                    if feat in scaler_features:
-                        idx = scaler_features.index(feat)
-                        model_feature_indices.append(idx)
-                    else:
-                        print(f"⚠️ Model feature '{feat}' not found in scaler features")
-                        # This shouldn't happen if everything is configured correctly
-                        # but we'll handle it by adding a zero column
-                        model_feature_indices.append(-1)
-                
-                # Extract the subset of scaled features that models need
-                if -1 in model_feature_indices:
-                    # Some features are missing, need to handle specially
-                    X_scaled = np.zeros((X_scaled_full.shape[0], len(model_features)))
-                    for i, idx in enumerate(model_feature_indices):
-                        if idx != -1:
-                            X_scaled[:, i] = X_scaled_full[:, idx]
-                else:
-                    # All features found, simple indexing
-                    X_scaled = X_scaled_full[:, model_feature_indices]
-                
-                print(f"✅ Final feature matrix shape: {X_scaled.shape} (extracted {len(model_features)} features from {len(scaler_features)} scaled features)")
-                return X_scaled, te_data
-            else:
-                # Scaler doesn't have feature names, try direct transformation
+            try:
                 X = te_data[model_features].fillna(0)
-                try:
-                    X_scaled = self.scaler.transform(X)
-                    print(f"✅ Applied scaler directly")
-                    return X_scaled, te_data
-                except Exception as e:
-                    print(f"⚠️ Scaler failed: {e}")
-                    print("Proceeding without scaling")
-                    return X.values, te_data
+                X_scaled = self.scaler.transform(X)
+                print(f"✅ Applied scaler to {len(model_features)} features")
+                return X_scaled, te_data
+            except Exception as e:
+                print(f"⚠️ Scaler failed: {e}")
+                print("Proceeding without scaling")
+                X = te_data[model_features].fillna(0)
+                return X.values, te_data
         else:
             # No scaler available
             X = te_data[model_features].fillna(0)
@@ -449,8 +554,14 @@ class TEInferenceEngine:
         bases = []
         vals = []
         for b, v in shap_dict.values():
-            bases.append(b)
-            vals.append(v)
+            if b is not None and v is not None:
+                bases.append(b)
+                vals.append(v)
+        
+        if not bases or not vals:
+            # Return default values if no valid SHAP data
+            return np.array([0.0]), np.array([[0.0]])
+            
         base_e = np.mean(np.vstack(bases), axis=0)
         vals_e = np.mean(np.stack(vals, axis=0), axis=0)
         return base_e, vals_e
@@ -529,7 +640,7 @@ class TEInferenceEngine:
 
         return predictions, rationales
 
-    def run_inference(self, seasons=[2024], past_weeks=None, upcoming_season=2025, upcoming_week=1, use_ensemble=True, output_file=None):
+    def run_inference(self, seasons=[2024], past_weeks=None, upcoming_season=2025, upcoming_week=1, master_sheet_path=None, use_ensemble=True, output_file=None):
         """Run inference for at least 5 past weeks (with actual points) and upcoming week."""
         print("🚀 TE Advanced Model Inference")
         print("=" * 50)
@@ -552,78 +663,186 @@ class TEInferenceEngine:
                 past_weeks.sort()
                 print(f"Updated past weeks: {past_weeks}")
 
-        # Load historical data for past weeks (includes prior weeks for lagging)
-        historical_data = pd.DataFrame()
-        if seasons and past_weeks:
-            historical_data = self.load_historical_data(seasons, past_weeks)
-            historical_data = self.calculate_actual_points(historical_data)
+        # --- BACKTEST (2024 weeks 13-17) ---
+        print("Loading 2024 TE data for backtest...")
+        wk24 = nfl.import_weekly_data([2024])
+        te24 = wk24[wk24["position"]=="TE"].copy()
+        te24["actual_points"] = te24["fantasy_points_ppr"].astype(float)
 
-        # Load upcoming week data
-        upcoming_data = pd.DataFrame()
-        if upcoming_season and upcoming_week:
-            upcoming_data = self.load_upcoming_data(upcoming_season, upcoming_week)
-            upcoming_data['prediction_week'] = True  # Mark for predictions
+        # Build lags/derived/enc before slicing holdout
+        te24 = add_te_lag_features(te24)
+        te24 = self.encode_categorical_features(te24)
 
-        # Combine datasets
-        te_data = pd.concat([historical_data, upcoming_data], ignore_index=True)
-        if len(te_data) == 0:
-            print("❌ No data found for specified seasons/weeks")
-            return None
+        backtest = te24[te24["week"].isin(past_weeks)].copy()
+        X_bt = self.prepare_features(backtest)[0] if hasattr(self, "prepare_features") else backtest[self.feature_names].fillna(0).values
 
-        # Show stats about the data
-        print(f"\nData summary:")
-        print(f"  Total records: {len(te_data)}")
-        print(f"  Unique players: {te_data['player_id'].nunique()}")
-        print(f"  Weeks in data: {sorted(te_data['week'].unique())}")
-        
-        # Prepare features (this creates lagged features)
-        X, te_data = self.prepare_features(te_data)
-
-        # Make predictions and get SHAP rationales
-        predictions, rationales = self.predict(X, te_data, use_ensemble)
-        if not predictions:
-            print("❌ No predictions generated")
-            return None
-
-        # Create output - ONLY for weeks we want predictions for
-        prediction_mask = te_data['prediction_week'] == True
-        output_data = te_data[prediction_mask].copy()
-        
-        # Create output DataFrame with predictions
-        output = output_data[['player_id', 'player_name', 'recent_team', 'position', 'season', 'week', 'actual_points']].copy()
-        
-        # Add predictions (subset to prediction weeks only)
-        for name, pred in predictions.items():
-            output[f'predicted_points_{name}'] = pred[prediction_mask]
-        
-        # Add rationales (subset to prediction weeks only)
-        all_rationales = np.array(rationales)
-        output['shap_rationale'] = all_rationales[prediction_mask]
-
-        # Sort by season, week, and ensemble predictions
-        if 'ensemble' in predictions:
-            output = output.sort_values(['season', 'week', 'predicted_points_ensemble'], ascending=[True, True, False])
-        else:
-            first_model = list(predictions.keys())[0]
-            output = output.sort_values(['season', 'week', f'predicted_points_{first_model}'], ascending=[True, True, False])
-
-        # Save results
-        if output_file:
-            output.to_csv(output_file, index=False)
-            print(f"✅ Results saved to {output_file}")
-
-        # Show top predictions per week
-        print(f"\nTop TE predictions by week:")
-        for (season, week), group in output.groupby(['season', 'week']):
-            print(f"\n--- Season {season}, Week {week} ---")
-            display_cols = ['player_name', 'recent_team', 'actual_points']
-            if 'predicted_points_ensemble' in output.columns:
-                display_cols.append('predicted_points_ensemble')
+        # Predict + SHAP (limit SHAP to LightGBM to avoid hangs)
+        preds_bt = {}
+        shap_dict = {}
+        for name, model in self.models.items():
+            p = model.predict(X_bt)
+            preds_bt[name] = p
+            if name == "lightgbm":
+                b, v = self.shap_for_lightgbm(model, X_bt)
             else:
-                display_cols.append(f'predicted_points_{list(predictions.keys())[0]}')
-            print(group[display_cols].head(10).to_string(index=False))
+                b, v = (None, None)
+            shap_dict[name] = (b, v)
 
-        return output
+        ens_bt = np.mean(np.vstack([v for v in preds_bt.values()]), axis=0)
+        base_bt, vals_bt = self.ensemble_shap(shap_dict)
+
+        backtest_out = backtest[["player_id","player_name","recent_team","position","season","week","actual_points"]].copy()
+        for name, v in preds_bt.items():
+            backtest_out[f"predicted_points_{name}"] = v
+        backtest_out["predicted_points_ensemble"] = ens_bt
+        backtest_out["shap_rationale"] = self.top_rationale_rows(X_bt, self.feature_names, base_bt, vals_bt, k=3, decimals=2)
+
+        # --- WEEK 1 (2025) from latest 2024 features ---
+        print("Building 2025 Wk1 TE rows from Master Sheet…")
+
+        # 1) schema
+        feature_names = self.feature_names
+
+        # 2) full 2024 feature table then take latest row per player
+        wb_2024 = nfl.import_weekly_data([2024])
+        raw_2024 = wb_2024[wb_2024["position"]=="TE"].copy()
+        feat_2024 = add_te_lag_features(raw_2024)
+        feat_2024 = self.encode_categorical_features(feat_2024)
+        latest_2024 = (
+            feat_2024.sort_values(["player_id","season","week"])
+                     .groupby("player_id")
+                     .tail(1)
+        )
+        latest_slice = latest_2024[["player_id"] + [c for c in feature_names if c in latest_2024.columns]].copy()
+
+        # 3) read Master Sheet (preferred id source)
+        dk = pd.read_csv(master_sheet_path)
+        dk_te = dk[dk["Position"]=="TE"].copy()
+
+        # if ids missing, try crosswalk (optional)
+        if "player_id" not in dk_te.columns or dk_te["player_id"].isna().all():
+            try:
+                cw = pd.read_csv(r"C:\Users\ruley\NFLDFSMasterSheet\data\processed\crosswalk_2025.csv")
+                cw["name_norm"] = cw["player_name"].map(norm_name)
+                cw["team_norm"] = cw["recent_team"].map(map_team)
+                dk_te["name_norm"] = dk_te["Name"].map(norm_name)
+                dk_te["team_norm"] = dk_te["TeamAbbrev"].map(map_team)
+                dk_te = dk_te.merge(
+                    cw[["name_norm","team_norm","player_id"]],
+                    on=["name_norm","team_norm"], how="left"
+                )
+            except Exception:
+                pass
+
+        # 4) DK → latest features by player_id
+        wk1 = dk_te.merge(latest_slice, on="player_id", how="left")
+
+        # 5) Meta fields
+        wk1["season"] = upcoming_season
+        wk1["week"]   = upcoming_week
+        wk1["season_type"] = "REG"
+        wk1["position"] = "TE"
+        wk1["recent_team"] = wk1.get("TeamAbbrev", wk1.get("recent_team", "UNK"))
+        wk1["player_name"] = wk1.get("Name", wk1.get("player_name", "Unknown"))
+        wk1["actual_points"] = np.nan
+        wk1["dk_salary"] = wk1["Salary"].astype(float)
+
+        # 6) Median fill for missing features (rookies etc.)
+        med = feat_2024[feature_names].median(numeric_only=True)
+        for col in feature_names:
+            if col not in wk1.columns:
+                wk1[col] = med.get(col, 0.0)
+        wk1[feature_names] = wk1[feature_names].fillna(med)
+
+        # 7) Predict Week 1 from exact model features
+        X_up = wk1[feature_names].fillna(0).values
+        preds_up = {}
+        shap_up = {}
+        for name, model in self.models.items():
+            preds_up[name] = model.predict(X_up)
+            if name == "lightgbm":
+                b, v = self.shap_for_lightgbm(model, X_up)
+            else:
+                b, v = (None, None)
+            shap_up[name] = (b, v)
+        ens_up = np.mean(np.vstack([v for v in preds_up.values()]), axis=0)
+        b_up, v_up = self.ensemble_shap(shap_up)
+
+        up_out = wk1[["player_id","player_name","recent_team","position","season","week"]].copy()
+        for name, v in preds_up.items():
+            up_out[f"predicted_points_{name}"] = v
+        up_out["predicted_points_ensemble"] = ens_up
+        up_out["dk_salary"] = wk1["dk_salary"].fillna(0).astype(float)
+        up_out["value"] = np.where(up_out["dk_salary"]>0, ens_up/(up_out["dk_salary"]/1000.0), np.nan)
+        up_out["actual_points"] = np.nan
+        up_out["shap_rationale"] = self.top_rationale_rows(X_up, feature_names, b_up, v_up, k=3, decimals=2)
+        
+        # Add historical features for TEs (similar to RB/WR models)
+        if 'targets' in raw_2024.columns:
+            print("Calculating historical features for TEs...")
+            
+            # Calculate historical averages for each player
+            historical_features = []
+            for player_id in up_out['player_id'].unique():
+                player_data = raw_2024[raw_2024['player_id'] == player_id].copy()
+                if len(player_data) >= 3:  # Need at least 3 weeks of data
+                    # Sort by season and week to get most recent data first
+                    player_data = player_data.sort_values(['season', 'week'], ascending=[False, False])
+                    
+                    # Calculate 3-week and 5-week averages for available columns
+                    targets_l3 = player_data['targets'].head(3).mean() if 'targets' in player_data.columns else 0.0
+                    targets_l5 = player_data['targets'].head(5).mean() if 'targets' in player_data.columns else 0.0
+                    target_share_l3 = player_data['target_share'].head(3).mean() if 'target_share' in player_data.columns else 0.0
+                    
+                    # For TEs, we don't have routes, snaps, or route_share in the current model
+                    # So we'll set these to 0.0 for consistency with the expected schema
+                    routes_l3 = 0.0
+                    routes_l5 = 0.0
+                    snaps_l3 = 0.0
+                    snaps_l5 = 0.0
+                    route_share_l3 = 0.0
+                    
+                    # Add to historical features list
+                    historical_features.append({
+                        'player_id': player_id,
+                        'targets_l3': targets_l3,
+                        'targets_l5': targets_l5,
+                        'routes_l3': routes_l3,
+                        'routes_l5': routes_l5,
+                        'snaps_l3': snaps_l3,
+                        'snaps_l5': snaps_l5,
+                        'target_share_l3': target_share_l3,
+                        'route_share_l3': route_share_l3,
+                        'rz_tgts_2024': 0.0,  # Placeholder for red zone targets
+                        'rz_rush_2024': 0.0   # Placeholder for red zone rushes (TEs don't rush much)
+                    })
+            
+            # Create historical features DataFrame and merge with output
+            if historical_features:
+                hist_df = pd.DataFrame(historical_features)
+                up_out = up_out.merge(hist_df, on='player_id', how='left')
+                
+                # Fill NaN values with 0.0
+                hist_cols = ['targets_l3', 'targets_l5', 'routes_l3', 'routes_l5', 'snaps_l3', 'snaps_l5', 
+                           'target_share_l3', 'route_share_l3', 'rz_tgts_2024', 'rz_rush_2024']
+                for col in hist_cols:
+                    if col in up_out.columns:
+                        up_out[col] = up_out[col].fillna(0.0)
+                
+                print(f"✅ Added historical features for {len(historical_features)} TE players")
+            else:
+                print("⚠️ No historical features calculated (insufficient data)")
+        else:
+            print("⚠️ Missing required columns for historical features calculation")
+
+        # --- COMBINE & SAVE ---
+        out = pd.concat([backtest_out, up_out], ignore_index=True)
+        out = out.sort_values(["season","week","predicted_points_ensemble"], ascending=[True,True,False])
+        out.to_csv(output_file, index=False)
+        print(f"✅ TE rows saved to {output_file}")
+        print(f"2025 Wk1 TEs: {len(up_out)} (nonzero salaries: {(up_out['dk_salary']>0).sum()})")
+
+        return out
 
 def main():
     """Main inference function."""
@@ -634,7 +853,8 @@ def main():
     parser.add_argument("--past-weeks", nargs='+', type=int, default=[13, 14, 15, 16, 17], help="Past weeks for actual points (defaults to 13-17)")
     parser.add_argument("--upcoming-season", type=int, default=2025, help="Season for upcoming week")
     parser.add_argument("--upcoming-week", type=int, default=1, help="Upcoming week to predict (defaults to 1)")
-    parser.add_argument("--output", default="te_predictions_advanced.csv", help="Output file")
+    parser.add_argument("--master-sheet", default=r"C:\Users\ruley\NFLDFSMasterSheet\data\processed\master_sheet_2025.csv", help="Path to DK salary master sheet")
+    parser.add_argument("--output", default="te_predictions_with_salaries.csv", help="Output file")
     parser.add_argument("--no-ensemble", action="store_true", help="Don't use ensemble predictions")
     args = parser.parse_args()
 
@@ -649,6 +869,7 @@ def main():
         past_weeks=args.past_weeks,
         upcoming_season=args.upcoming_season,
         upcoming_week=args.upcoming_week,
+        master_sheet_path=args.master_sheet,
         use_ensemble=not args.no_ensemble,
         output_file=args.output
     )

@@ -9,6 +9,14 @@ import pandas as pd
 import re
 import os
 from pathlib import Path
+from datetime import datetime
+
+
+def generate_slate_id(df, source_path):
+    """Generate unique ID for this specific slate"""
+    slate_date = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slate_size = len(df)
+    return f"slate_{slate_date}_{slate_size}"
 
 
 def clean_name(name):
@@ -81,6 +89,19 @@ def process_dk_file(dk_file, roster_df, roster_lookup, alias_lookup, args):
     dk_df = pd.read_csv(dk_file)
     print(f"DK data: {len(dk_df)} rows")
     print(f"DK columns: {list(dk_df.columns)}")
+    
+    # Generate slate ID and save snapshot
+    slate_id = generate_slate_id(dk_df, dk_file)
+    
+    # Save slate snapshot
+    slate_snapshot_path = f'data/processed/history/2025/{slate_id}_DKSalaries.csv'
+    os.makedirs(os.path.dirname(slate_snapshot_path), exist_ok=True)
+    dk_df.to_csv(slate_snapshot_path, index=False)
+    print(f"Saved slate snapshot: {slate_snapshot_path}")
+    
+    # Also save as "current" slate for reference
+    dk_df.to_csv('data/processed/current_slate.csv', index=False)
+    print(f"Saved current slate: data/processed/current_slate.csv")
     
     # Parse slate date from filename if in batch mode
     slate_date = None

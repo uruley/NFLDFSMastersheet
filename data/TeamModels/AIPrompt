@@ -1,0 +1,259 @@
+# AI Starter Prompt: NFL Team Total Training Model
+
+## PROJECT OVERVIEW
+You are working with an advanced NFL team total prediction model that forecasts game scores, outcomes, and offensive yards. This model is designed for DFS (Daily Fantasy Sports) optimization and sports betting analysis.
+
+## MODEL PURPOSE
+The model predicts:
+1. **Home team score** for each NFL game
+2. **Away team score** for each NFL game  
+3. **Win probability** (home team winning)
+4. **Expected offensive yards** for both teams
+5. **Feature importance analysis** using SHAP values
+
+## DATA SOURCE & SCOPE
+- **Data Provider**: `nfl_data_py` library
+- **Time Period**: 2014-2024 (11 seasons)
+- **Data Type**: NFL regular season schedules, scores, and play-by-play
+- **Training Set**: 2014-2023 (10 seasons, ~2,600 games)
+- **Test Set**: 2024 (1 season, ~272 games)
+
+## CORE ARCHITECTURE
+
+### 1. DATA LOADING & PREPROCESSING
+```python
+# Load schedule data for all seasons
+sched = nfl.import_schedules(SEASONS)
+sched = sched[sched["game_type"] == "REG"]  # Regular season only
+
+# Required columns (create if missing):
+cols_keep = ["game_id","season","week","gameday","home_team","away_team",
+             "home_score","away_score","spread_line","total_line","roof","surface","weekday"]
+```
+
+### 2. FEATURE ENGINEERING STRATEGY
+The model creates a **long-format team-game table** to build rolling features:
+
+```python
+# Create home and away perspectives for each game
+home = sched[["game_id","season","week","gameday","home_team","away_team","home_score","away_score"]].copy()
+away = sched[["game_id","season","week","gameday","home_team","away_team","home_score","away_score"]].copy()
+
+# Rename columns for consistency
+home.rename(columns={"home_team":"team","away_team":"opp","home_score":"points_for","away_score":"points_against"}, inplace=True)
+away.rename(columns={"away_team":"team","home_team":"opp","away_score":"points_for","home_score":"points_against"}, inplace=True)
+
+# Combine into long format
+team_game = pd.concat([home, away], ignore_index=True)
+team_game.sort_values(["team","gameday"], inplace=True)
+```
+
+### 3. ROLLING FEATURES (LEAK-PROOF)
+**Critical**: Use `shift(1)` before rolling to prevent data leakage:
+
+```python
+# Rolling 3-game means (offense & defense), shifted to avoid leakage
+for col in ["points_for","points_against"]:
+    team_game[f"{col}_l3"] = team_game.groupby("team")[col].shift(1).rolling(3, min_periods=1).mean()
+
+# Rest days since last game
+team_game["prev_gameday"] = team_game.groupby("team")["gameday"].shift(1)
+team_game["rest_days"] = (team_game["gameday"] - team_game["prev_gameday"]).dt.days
+team_game["rest_days"] = team_game["rest_days"].fillna(10).clip(0, 30)
+```
+
+### 4. FEATURE MERGING STRATEGY
+Merge rolling features back to wide schedule format with home/away prefixes:
+
+```python
+# Create feature side-tables
+feat_cols_team = ["game_id","team","points_for_l3","points_against_l3","rest_days"]
+feat_team = team_game[feat_cols_team].copy()
+
+# Rename for home and away perspectives
+home_feat = feat_team.rename(columns={
+    "team":"home_team",
+    "points_for_l3":"home_pf_l3",
+    "points_against_l3":"home_pa_l3",
+    "rest_days":"home_rest"
+})
+away_feat = feat_team.rename(columns={
+    "team":"away_team",
+    "points_for_l3":"away_pf_l3",
+    "points_against_l3":"away_pa_l3",
+    "rest_days":"away_rest"
+})
+
+# Merge back to main schedule
+df = sched.merge(home_feat, on=["game_id","home_team"], how="left") \
+          .merge(away_feat, on=["game_id","away_team"], how="left")
+```
+
+**IMPORTANT**: The merge creates duplicate columns with suffixes `_x` and `_y`. Use the correct column names:
+```python
+base_feats = [
+    "spread_line","total_line",
+    "home_pf_l3","home_pa_l3","home_rest_y",  # Note: _y suffix
+    "away_pf_l3","away_pa_l3","away_rest_y",  # Note: _y suffix
+    "is_dome"
+]
+```
+
+### 5. TEAM IDENTITY FEATURES
+One-hot encode team names for individual team effects:
+
+```python
+onehot = pd.get_dummies(df[["home_team","away_team"]], prefix=["home","away"], dtype=int)
+X_all = pd.concat([df[base_feats], onehot], axis=1).fillna(0)
+```
+
+### 6. MODEL TRAINING APPROACH
+**Dual LightGBM Models**: Train separate models for home and away scores:
+
+```python
+lgb_params = dict(
+    n_estimators=1200,
+    learning_rate=0.02,
+    max_depth=-1,
+    num_leaves=63,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.0,
+    reg_lambda=1.0,
+    min_child_samples=20,
+    random_state=42
+)
+
+model_home = lgb.LGBMRegressor(**lgb_params)
+model_away = lgb.LGBMRegressor(**lgb_params)
+
+# Train on 2014-2023, test on 2024
+train_idx = df["season"] < 2024
+test_idx  = df["season"] == 2024
+
+X_train, X_test = X_all[train_idx], X_all[test_idx]
+y_train_home, y_test_home = y_home[train_idx], y_home[test_idx]
+y_train_away, y_test_away = y_away[train_idx], y_away[test_idx]
+```
+
+### 7. WIN PROBABILITY MODEL
+Use predicted score margin to predict game outcomes:
+
+```python
+# Calculate margin from score predictions
+train_margin = pred_home_train - pred_away_train
+train_win = (y_train_home > y_train_away).astype(int)
+
+# Logistic regression for win probability
+logit = LogisticRegression(solver="lbfgs")
+logit.fit(train_margin.reshape(-1,1), train_win)
+
+# Predict win probability on test set
+test_margin = pred_home - pred_away
+home_win_prob = logit.predict_proba(test_margin.reshape(-1,1))[:,1]
+```
+
+### 8. YARDS PREDICTION
+Load play-by-play data for offensive yards:
+
+```python
+def compute_expected_yards(df_sched, Xtr, Xte):
+    try:
+        pbp = nfl.import_pbp_data(SEASONS)
+        pbp = pbp[~pbp["posteam"].isna()].copy()
+        
+        # Sum yards per team per game
+        team_yards = pbp.groupby(["game_id","posteam"])["yards_gained"].sum().reset_index()
+        
+        # Merge with schedule data
+        mhome = df_sched[["game_id","home_team"]].merge(team_yards, 
+            left_on=["game_id","home_team"], right_on=["game_id","posteam"], how="left")
+        maway = df_sched[["game_id","away_team"]].merge(team_yards, 
+            left_on=["game_id","away_team"], right_on=["game_id","posteam"], how="left")
+        
+        # Train separate yards models
+        ymodel_home = lgb.LGBMRegressor(**yard_model_params)
+        ymodel_away = lgb.LGBMRegressor(**yard_model_params)
+        
+        return actual_home_yards, actual_away_yards, pred_home_yards, pred_away_yards
+        
+    except Exception as e:
+        # Fallback: ~15 yards per point
+        ph_y = pd.Series(pred_home * 15.0, index=df_sched[test_idx].index)
+        pa_y = pd.Series(pred_away * 15.0, index=df_sched[test_idx].index)
+        return actual_home_yards, actual_away_yards, ph_y, pa_y
+```
+
+### 9. SHAP ANALYSIS
+Generate feature importance rankings:
+
+```python
+explainer_home = shap.TreeExplainer(model_home)
+explainer_away = shap.TreeExplainer(model_away)
+
+# Use sample for speed
+X_shap = X_train.sample(min(len(X_train), 5000), random_state=42)
+shap_home_vals = explainer_home.shap_values(X_shap)
+shap_away_vals = explainer_away.shap_values(X_shap)
+
+def mean_abs_shap(shap_vals, cols):
+    m = np.mean(np.abs(shap_vals), axis=0)
+    out = pd.DataFrame({"feature": cols, "mean_abs_shap": m}).sort_values("mean_abs_shap", ascending=False)
+    return out
+```
+
+## OUTPUT STRUCTURE
+
+### Files Generated:
+1. **`predictions_2024.csv`**: Game-by-game predictions with actual vs predicted scores, win probabilities, and yards
+2. **`metrics.txt`**: Model performance metrics (MAE, accuracy, Brier score, confusion matrix)
+3. **`shap_home_meanabs.csv`**: Feature importance for home score model
+4. **`shap_away_meanabs.csv`**: Feature importance for away score model
+5. **`model_features.csv`**: List of all features used in training
+
+### Key Columns in Predictions:
+- `pred_home_score`, `pred_away_score`: Predicted team scores
+- `home_win_prob`: Probability home team wins
+- `exp_home_yards`, `exp_away_yards`: Expected offensive yards
+- `home_error_abs`, `away_error_abs`: Absolute prediction errors
+
+## EXPECTED PERFORMANCE
+- **Score MAE**: ~7.8 points (both home and away)
+- **Win Prediction Accuracy**: ~66%
+- **Brier Score**: ~0.31 (lower is better)
+- **Top Features**: Vegas spread, total line, 3-game rolling averages
+
+## COMMON ISSUES & SOLUTIONS
+
+### 1. Column Name Conflicts
+**Problem**: Merge creates duplicate columns with `_x` and `_y` suffixes
+**Solution**: Use the correct suffix in `base_feats` list
+
+### 2. Data Leakage Prevention
+**Problem**: Using same-week data in features
+**Solution**: Always use `shift(1)` before rolling operations
+
+### 3. Missing Dependencies
+**Required**: `nfl_data_py`, `lightgbm`, `shap`, `scikit-learn`, `pandas`, `numpy`
+
+### 4. Memory Management
+**Issue**: Large play-by-play datasets
+**Solution**: Sample data for SHAP analysis, use efficient data types
+
+## INTEGRATION WITH DFS SYSTEM
+This model provides the foundation for:
+- **Team stacking strategies** (high-scoring game environments)
+- **DST selection** (low-scoring games = better DST)
+- **Player projection context** (team scoring environment)
+- **Game total betting** (over/under predictions)
+
+## NEXT STEPS FOR AI
+When working with this model:
+1. **Verify data loading** - Check `nfl_data_py` availability
+2. **Inspect column structure** - Ensure merge operations work correctly
+3. **Monitor feature engineering** - Prevent data leakage
+4. **Validate predictions** - Check for reasonable score ranges
+5. **Integrate with position models** - Combine team and player predictions
+
+This model represents a sophisticated approach to NFL game prediction that combines traditional sports betting wisdom (Vegas lines) with modern machine learning techniques (LightGBM + SHAP) for comprehensive game analysis.
+
